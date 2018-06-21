@@ -8,6 +8,10 @@ import matplotlib.pyplot as plt
 
 
 class Session:
+    """This is the director of all experiments done with a single dataset
+
+    All raw time series are associated to a single session, which manages the logs, predictions, plots and reports
+    of different forecasting strategies and dataset representations (real-valued, ordinal, stacked, etc.)"""
     def __init__(self, directory):
         if directory[-1] != '/':
             directory += '/'
@@ -19,20 +23,15 @@ class Session:
         if not os.path.isdir(directory):
             print 'Creating new session: {}...'.format(directory)
             os.makedirs(directory)
-            os.makedirs(directory + 'experiments/')
             os.makedirs(directory + 'datasets/')
-            os.makedirs(directory + 'logs/')
 
 
         print 'Opening session: {}...'.format(directory)
         self.experiments_directory = directory + 'experiments/'
         self.datasets_directory = directory + 'datasets/'
 
-        # load experiments
-        for exp_fname in os.listdir(self.experiments_directory):
-            print exp_fname
-
     def start_experiment(self, dataset, StrategyClass):
+        """This initiates a new experiment with a forecasting strategy"""
         if not os.path.isdir(self.directory + StrategyClass.id):
             os.makedirs(self.directory + StrategyClass.id)
             os.makedirs(self.directory + StrategyClass.id + '/models/')
@@ -46,6 +45,10 @@ class Session:
 
 
 class StrategyExperiment:
+    """This manages a strategy's fitting, hyperparameter selection and evaluation.
+
+    This acts as a directory handler that queries, stores and manages the different products of an experiment:
+    parameter fitting, hyperparameter selection, model evaluation and plot generation."""
     def __init__(self, dataset, folder, StrategyClass):
         self.dataset = dataset  # type: Dataset
         self.all_specs = {}  # type: dict
@@ -53,13 +56,33 @@ class StrategyExperiment:
         self.Strategy = StrategyClass  # type: class
 
     def build_prediction(self, prediction):
+        """Adapts the raw prediction of a strategy into the correct format as given by the dataset's representation"""
         # type: (dict) -> Prediction
+        if self.dataset.optional_params.get('is_attractor', False):
+            for k, v in prediction.items():
+                prediction[k] = v.take(-1, axis=-1)
+
         if self.dataset.optional_params.get('is_ordinal', False):
             prediction['bins'] = self.dataset.optional_params['bins']
             return OrdinalPrediction(**prediction)
 
+        return GaussianPrediction(**prediction)
+
     def choose_model(self, tests, hypergrid_keys, expanded_hypergrid, prediction_index,
                      predictive_horizon, plots=[], fit_kwargs={}, eval_kwargs={}, mode='val'):
+        """Executes the model selection and evaluation pipeline
+
+        Args:
+            tests (List[TestDefinition]): criteria and targets used to evaluate predictions
+            hypergrid_keys (List[str]): names of the Strategy's attributes
+            expanded_hypergrid (list): hyperparameter configurations to be evaluated
+            prediction_index (int): time index of the first prediction to be obtained
+            predictive_horizon (int): length of the forecast
+            plots (List[str]): plots to be requested from obtained predictions
+            fit_kwargs (dict): optional parameters to be passed on the Strategy's fit method
+            eval_kwards (dict): optional parameters to be passed on the Strategy's predict method
+            mode (str): whether the method should use the validation or test data
+        """
         # type: (List[TestDefinition], dict, int, int, dict, dict, dict) -> {}
         best_results = {}
         best_strategy = {}
@@ -92,7 +115,7 @@ class StrategyExperiment:
                     model = self.Strategy.load(model_fname)
                 else:
                     print 'Training new model with specification: {}'.format(spec)
-                    model = self.Strategy(spec)
+                    model = self.Strategy(**spec)
                     model.fit(self.dataset.train_frames, **fit_kwargs)
                     model.save(self.folder + 'models/')
 
@@ -100,8 +123,7 @@ class StrategyExperiment:
                 assert seed_start >= 0, \
                     "Prediction index {} must be greater than model strategy seed length".format(prediction_index,
                                                                                                  model.seed_length)
-                seed_end = seed_start + predictive_horizon
-                model_input = eval_ts[np.newaxis, seed_start:seed_end]
+                model_input = eval_ts[np.newaxis, seed_start:prediction_index]
 
                 prediction = model.predict(model_input,
                                            predictive_horizon=predictive_horizon,

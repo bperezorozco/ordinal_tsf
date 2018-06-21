@@ -5,16 +5,16 @@ from util import assert_sum_one, all_satisfy, frame_ts, is_univariate
 import pickle
 import numpy as np
 import seaborn as sns
-import GPy as gpy
+from scipy.stats import norm
 
 
 class Dataset:
+    """Handler for a time series dataset and its different representations."""
     train_ts = None
     val_ts = None
     test_ts = None
 
-    def __init__(self, raw_ts, frame_length, p_train=0.7, p_val=0.15, p_test=0.15,
-                 signal_preprocessing_steps=[], structural_preprocessing_steps=[]):
+    def __init__(self, raw_ts, frame_length, p_train=0.7, p_val=0.15, p_test=0.15, preprocessing_steps=[]):
         assert assert_sum_one([p_train, p_val, p_test]) \
                and all_satisfy([p_train, p_val, p_test], lambda x: x > 0.), \
                "Please make sure p_train, p_val, p_test are positive and sum up to 1."
@@ -29,16 +29,7 @@ class Dataset:
 
         self.train_ts, self.val_ts, self.test_ts = self.raw_train_ts, self.raw_val_ts, self.raw_test_ts
 
-        for step in signal_preprocessing_steps:
-            self.train_ts = step.apply(self.train_ts)
-            self.val_ts = step.apply(self.val_ts)
-            self.test_ts = step.apply(self.test_ts)
-
-            self.optional_params.update(step.param_dict)
-
-        self.train_ts_prep, self.val_ts_prep, self.test_ts_prep = self.train_ts, self.val_ts, self.test_ts
-
-        for step in structural_preprocessing_steps:
+        for step in preprocessing_steps:
             self.train_ts = step.apply(self.train_ts)
             self.val_ts = step.apply(self.val_ts)
             self.test_ts = step.apply(self.test_ts)
@@ -85,6 +76,7 @@ class Dataset:
         return 'Dataset with properties:\n' + props
 
     def get_default_fname(self, id):
+        """Dataset's default name based on its own preprocessing pipeline."""
         fname = id
 
         if 'white_noise_level' in self.optional_params:
@@ -96,9 +88,15 @@ class Dataset:
         if 'is_ordinal' in self.optional_params:
             fname += '_ordinal'
 
+        if 'is_attractor' in self.optional_params:
+            fname += '_attractor'
+
         return fname
 
     def apply_partial_preprocessing(self, mode, enabled_steps):
+        """Queries a specific representation of the given dataset
+
+        Applies a pipeline of preprocessing steps to obtain a dataset representation."""
         # type: (str, List[DatasetPreprocessingStep]) -> np.ndarray
         assert mode in ['train', 'test', 'val'], "Mode must be one of [train, val, test]"
 
@@ -116,17 +114,29 @@ class Dataset:
 
 
 class DatasetPreprocessingStep:
+    """Provides a common interface for the individual transformations of the dataset preprocessing pipeline
+
+    Attributes:
+        is_fitted (bool): All preprocessing steps have to be fitted to the input time series
+        param_dict (dict): Communication protocol from the step's attributes that must be known by the caller
+    """
     __metaclass__ = ABCMeta
     is_fitted = False
     param_dict = {}
 
     @abstractmethod
     def apply(self, ts):
+        """Common interface to perform a transformation from a raw time series to its new representation"""
         # type: (np.ndarray) -> np.ndarray
         pass
 
 
 class WhiteCorrupter(DatasetPreprocessingStep):
+    """Adds white noise to a time series
+
+    Args:
+        sigma (float): noise standard deviation
+    """
     def __init__(self, sigma=1e-3):
         self.noise_level = sigma
 
@@ -136,6 +146,7 @@ class WhiteCorrupter(DatasetPreprocessingStep):
 
 
 class Standardiser(DatasetPreprocessingStep):
+    """Makes a time series zero-mean, unit-variance"""
     def __init__(self):
         self.mean = None
         self.std = None
@@ -155,6 +166,7 @@ class Standardiser(DatasetPreprocessingStep):
 
 
 class Quantiser(DatasetPreprocessingStep):
+    """Computes ordinal bins and allocates each observation in the time series."""
     def __init__(self, n_bins=None, delta=1e-3):
         self.n_bins = n_bins
         self.delta = delta
@@ -196,16 +208,20 @@ class Quantiser(DatasetPreprocessingStep):
 
 
 class AttractorStacker(DatasetPreprocessingStep):
+    """Stacks a time series with lagged representations of itself, in an attractor-like fashion."""
     def __init__(self, lag):
         self.lag = lag
 
     def apply(self, ts):
         self.is_fitted = True
-        self.param_dict = {'attractor_lag':self.lag}
+        self.param_dict = {'attractor_lag': self.lag,
+                           'n_channels': 3,
+                           'is_attractor': True}
         return np.stack((ts[:-2*self.lag], ts[self.lag:-self.lag], ts[2*self.lag:]), axis=-1)
 
 
 class Selector(DatasetPreprocessingStep):
+    """Extracts a subsequence of length ``horizon`` from index ``start``"""
     def __init__(self, start, horizon):
         self.start = start
         self.end = start + horizon
@@ -216,43 +232,69 @@ class Selector(DatasetPreprocessingStep):
 
 
 class Prediction:
+    """Provides a common interface for the output predictions of different forecasting strategies    """
+    __metaclass__ = ABCMeta
     type = 'deterministic'
 
-    def __init__(self, forecast):
-        self.forecast = forecast
+    @abstractmethod
+    def mse(self, ground_truth): pass
 
-    def mse(self, ground_truth):
-        mean_squared_error(ground_truth, self.forecast)
+    @abstractmethod
+    def nll(self, ground_truth): pass
 
 
 class OrdinalPrediction(Prediction):
+    """Encapsulates a sequential ordinal predictive posterior distribution.
+
+       This implements the strategy to compute metrics and plots where the predictive distribution is assumed to be
+       ordinal/categorical at every timestep.
+
+       Args:
+           ordinal_pdf (np.ndarray): The ordinal output of the forecasting model
+           draws (np.ndarray): The draws obtained from the forecasting model
+           bins (np.ndarray): The bins used the decode the sample trajectory draws
+
+       Attributes:
+           ordinal_pdf (np.ndarray): The ordinal output of the forecasting model
+           draws (np.ndarray): The draws obtained from the forecasting model
+           bins (np.ndarray): The bins used the decode the sample trajectory draws
+           delta (float): Bin width used to reinterpret ordinal pdf as a piecewise uniform pdf
+       """
+
     type = 'ordinal'
 
     def __init__(self, ordinal_pdf, draws, bins):
         self.ordinal_pdf = ordinal_pdf
-        self.draws = np.array([[bins[j] for j in draw] for draw in draws]).T
+        self.draws = np.array([[bins[j] for j in draw] for draw in draws])
         self.bins = bins
         self.delta = self.bins[1] - self.bins[0]
 
-    def add_more_draws(self, n_draws): pass
-
     def mse(self, ground_truth):
+        """Computes MSE between two real-valued time series"""
+        # type: (np.ndarray) -> np.float
         return np.mean([mean_squared_error(ground_truth, p) for p in self.draws])
 
     def mse_and_std(self, ground_truth):
+        """Computes MSE +- STD between two real-valued time series"""
+        # type: (np.ndarray) -> np.float
         all_mse = [mean_squared_error(ground_truth, prediction) for prediction in self.draws]
         return np.mean(all_mse), np.std(all_mse)
 
     def nll(self, binned_ground_truth):
+        """Computes NLL of drawing a time series from a piecewise uniform sequential prediction"""
+        # type: (np.ndarray) -> np.float
         p_ground_truth = (self.ordinal_pdf * binned_ground_truth / self.delta).max(axis=-1)
         neg_log_p_ground_truth = -np.log(p_ground_truth)
         return neg_log_p_ground_truth.sum()
 
     def get_quantile(self, alpha):
+        """Computes \alpha-quantiles given the object's ordinal pdf"""
+        # type: (np.ndarray) -> np.float
         cdf = self.ordinal_pdf.cumsum(axis=-1)
         return np.array([self.bins[j] for j in (cdf >= alpha).argmax(axis=-1)])
 
     def plot_median_2std(self, plt, ground_truth):
+        """Plots a probabilistic forecast's median and 2.5, 97.5 quantiles alongside the corresponding ground truth"""
         quantile_025 = self.get_quantile(0.025)
         quantile_975 = self.get_quantile(0.975)
         quantile_median = self.get_quantile(0.5)
@@ -264,26 +306,76 @@ class OrdinalPrediction(Prediction):
         plt.legend(['Quantile 0.025', 'Quantile 0.975', 'Median', 'True'])
 
     def plot_like(self, plt):
+        """Plots the full ordinal pdf as a heatmap"""
         plt.imshow(self.ordinal_pdf.T, cmap=ListedColormap(sns.color_palette("RdBu_r", 500).as_hex()),
                    origin='lower', aspect='auto')
 
     def plot_log_like(self, plt):
+        """Plots the full log ordinal pdf as a heatmap"""
         log_like = np.ma.log(self.ordinal_pdf.T)
         plt.imshow(log_like, cmap=ListedColormap(sns.color_palette("RdBu_r", 500).as_hex()),
                    origin='lower', aspect='auto')
 
 
-
 class GaussianPrediction(Prediction):
+    """Encapsulates a sequential Gaussian predictive posterior distribution.
+
+    This implements the strategy to compute metrics and plots where the predictive distribution assumed to be
+    Gaussian at every timestep.
+
+    Args:
+        draws (np.ndarray): The draws obtained from the forecasting model
+
+    Attributes:
+        posterior_mean (np.ndarray): Monte Carlo approximation of the posterior predictive mean
+        posterior_std (np.ndarray): Monte Carlo approximation of the posterior predictive standard deviation
+    """
+
     type = 'gaussian'
 
-    def __init__(self, posterior_mean, posterior_std, draws):
-        self.posterior_mean = posterior_mean
-        self.posterior_std = posterior_std
+    def __init__(self, draws):
+        self.posterior_mean = draws.mean(axis=0)
+        self.posterior_std = draws.std(axis=0)
         self.draws = draws
+
+    def mse(self, ground_truth):
+        """Computes MSE between two real-valued time series"""
+        # type: (np.ndarray) -> np.float
+        return np.mean([mean_squared_error(ground_truth, p) for p in self.draws])
+
+    def nll(self, ground_truth):
+        """Computes NLL of drawing a time series from a GP sequential prediction"""
+        # type: (np.ndarray) -> np.float
+        horizon = self.posterior_mean.shape[0]
+        likelihood = np.array([norm(loc=self.posterior_mean[i], scale=self.posterior_std[i]).pdf(ground_truth[i])
+                               for i in range(horizon)])
+
+        print 'NLL: {}'.format(-np.log(likelihood).sum())
+
+    def plot_median_2std(self, plt, ground_truth):
+        """Plots a probabilistic forecast's median and 2.5, 97.5 quantiles alongside the corresponding ground truth"""
+        quantile_median = self.posterior_mean
+        quantile_025 = quantile_median - 2 * self.posterior_std
+        quantile_975 = quantile_median + 2 * self.posterior_std
+
+        plt.plot(quantile_025, 'xkcd:orange')
+        plt.plot(quantile_975, 'xkcd:orange')
+        plt.plot(quantile_median, 'xkcd:maroon')
+        plt.plot(ground_truth, 'xkcd:olive')
+        plt.legend(['Quantile 0.025', 'Quantile 0.975', 'Median', 'True'])
 
 
 class TestDefinition:
+    """Defines a ground truth and a metric to evaluate predictions on.
+
+    By defining a sequence of tests, we
+
+    Args:
+        metric_key (str): Name of the metric method to invoke on the provided predictions
+        ground_truth (np.ndarray): True time series to compare forecasts with under the provided metric
+        compare (function):
+    """
+
     def __init__(self, metric_key, ground_truth, compare=None):
         self.metric = metric_key
         self.ground_truth = ground_truth
@@ -293,6 +385,7 @@ class TestDefinition:
             self.compare = compare
 
     def eval(self, prediction):
+        """Evaluates the forecast """
         # type: (Prediction) -> float
         metric_eval = getattr(prediction, self.metric, None)
 

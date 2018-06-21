@@ -4,7 +4,7 @@ from ordinal_tsf.model import MordredStrategy
 from ordinal_tsf.dataset import Dataset, Quantiser, Standardiser, WhiteCorrupter, AttractorStacker, Selector, TestDefinition
 from ordinal_tsf.session import Session
 from ordinal_tsf.util import cartesian
-os.environ["CUDA_VISIBLE_DEVICES"]="4"
+os.environ["CUDA_VISIBLE_DEVICES"]="3"
 
 
 MAX_LENGTH = 30000
@@ -16,7 +16,6 @@ ATTRACTOR_LAG = 10
 EFFECTIVE_LAG = 0
 VALIDATION_PREDICTIVE_HORIZON = 500
 TEST_PREDICTIVE_HORIZON = 1000
-DECODER_SEED_LENGTH = 1
 # open/create session (folder name) (includes raw time series loading)
 # choose experiment (includes model preparation)
 best_models = {}
@@ -30,8 +29,8 @@ train_spec = {'epochs': 50, 'batch_size': 256, 'validation_split': 0.15}
 
 for DS in ['webtsslp', 'webtsair', 'EMexptqp2', 'EMlorenz', 'air', 'mg', 'heart', 'tide']:
     sess = Session('{}'.format(DS))
-    VALIDATION_START_INDEX = LOOKBACK + 2 * ATTRACTOR_LAG + DECODER_SEED_LENGTH
-    TEST_START_INDEX = LOOKBACK + 2 * ATTRACTOR_LAG + DECODER_SEED_LENGTH
+    VALIDATION_START_INDEX = LOOKBACK + 2 * ATTRACTOR_LAG + 1
+    TEST_START_INDEX = LOOKBACK + 2 * ATTRACTOR_LAG + 1
 
     x = pd.read_feather('../ds/{}.feather'.format(DS)).values[:MAX_LENGTH]
     stand = Standardiser()
@@ -39,21 +38,20 @@ for DS in ['webtsslp', 'webtsair', 'EMexptqp2', 'EMlorenz', 'air', 'mg', 'heart'
     white_noise = WhiteCorrupter()
     att_stacker = AttractorStacker(10)
 
-    dataset = Dataset(x, LOOKBACK + HORIZON + DECODER_SEED_LENGTH, p_val=0.15, p_test=0.15, preprocessing_steps=[stand, quant])
+    dataset = Dataset(x, LOOKBACK + HORIZON + 1, p_val=0.15, p_test=0.15, preprocessing_steps=[stand, quant, att_stacker])
     if dataset.optional_params.get('is_attractor', False):
         EFFECTIVE_LAG = 2*ATTRACTOR_LAG
 
-    mordred_search_space['ordinal_bins'] = [quant.n_bins]
     mordred_search_space['n_channels'] = [dataset.optional_params.get('n_channels', 1)]
-
     selector = Selector(VALIDATION_START_INDEX, VALIDATION_PREDICTIVE_HORIZON)
     continuous_ground_truth = dataset.apply_partial_preprocessing('val', [selector, stand])
     ordinal_ground_truth = dataset.apply_partial_preprocessing('val', [selector, stand, quant])
-
     validation_tests = [TestDefinition('mse', continuous_ground_truth),
                         TestDefinition('nll', ordinal_ground_truth)]
     validation_plots = {'plot_median_2std': {'ground_truth':continuous_ground_truth},
                         'plot_like': {}}
+
+    mordred_search_space['ordinal_bins'] = [quant.n_bins]
 
     experiment = sess.start_experiment(dataset, MordredStrategy)
     best_models[DS] = experiment.choose_model(validation_tests,
@@ -72,7 +70,6 @@ for DS in ['webtsslp', 'webtsair', 'EMexptqp2', 'EMlorenz', 'air', 'mg', 'heart'
     selector = Selector(TEST_START_INDEX, TEST_PREDICTIVE_HORIZON)
     continuous_ground_truth = dataset.apply_partial_preprocessing('test', [selector, stand])
     ordinal_ground_truth = dataset.apply_partial_preprocessing('test', [selector, stand, quant])
-
     final_tests = [TestDefinition('mse', continuous_ground_truth),
                    TestDefinition('nll', ordinal_ground_truth)]
     test_plots = {'plot_median_2std': {'ground_truth': continuous_ground_truth},

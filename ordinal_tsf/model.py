@@ -1,18 +1,18 @@
-import keras
 from abc import ABCMeta, abstractmethod, abstractproperty
 from keras import Model, Sequential, Input
-from keras.layers import Dense, LSTM, Average, Bidirectional, Dropout
+from keras.layers import Dense, LSTM, Average, Bidirectional, Dropout, Concatenate
 from keras.regularizers import l2
 from keras.callbacks import ModelCheckpoint, EarlyStopping
 import keras.backend as K
 import pickle
-from dataset import Dataset
 import numpy as np
+import GPy as gpy
 import random
 import os
 
 
 class ModelStrategy:
+    """Provides a common interface for the forecasting strategy to be used at runtime."""
     __metaclass__ = ABCMeta
     filename = 'tmp_'
 
@@ -38,87 +38,115 @@ class ModelStrategy:
 
 
 class MordredStrategy(ModelStrategy):
-    required_spec_keys = ['ordinal_bins', 'units', 'dropout_rate', 'lambda', 'horizon', 'lookback']
+    """Implements the ordinal sequence-to-sequence time series forecasting strategy."""
+    required_spec_keys = ['ordinal_bins', 'units', 'dropout_rate', 'lam', 'horizon', 'lookback']
     id = 'mordred'
 
-    def __init__(self, model_spec):
-        assert all([k in model_spec for k in self.required_spec_keys])
-        self.n_bins = model_spec['ordinal_bins']
-        self.n_hidden = model_spec['units']
-        self.dropout_rate = model_spec['dropout_rate']
-        self.lam = model_spec['lambda']
-        self.lookback = model_spec['lookback']
-        self.horizon = model_spec['horizon']
-        self.filename = MordredStrategy.get_filename(model_spec)
+    def __init__(self, ordinal_bins=85, units=64, dropout_rate=0.25, lam=1e-9,
+                 lookback=100, horizon=100, n_channels=1, custom_objs=[]):
+        # type: (dict) -> None
+        self.n_bins = ordinal_bins
+        self.n_hidden = units
+        self.dropout_rate = dropout_rate
+        self.lam = lam
+        self.lookback = lookback
+        self.horizon = horizon
+        self.n_channels = n_channels
+        self.filename = 'mordred_{}_bins_{}_hidden_{}_dropout_{}_l2_lookback_{}_horizon_{}_channels_{}'.format(
+            self.n_bins, self.n_hidden, self.dropout_rate, self.lam, self.lookback, self.horizon, self.n_channels)
 
-        if 'custom_objs' not in model_spec: model_spec['custom_objs'] = []
-
-        custom_objs = model_spec['custom_objs']
-
-        neural_network_builder = KerasSequentialBuilder()
+        loss = 'categorical_crossentropy'
+        custom_objs = custom_objs
 
         lstm_spec = {'units': self.n_hidden,
                      'return_state': True,
-                     'kernel_regularizer': self.lam,
-                     'recurrent_regularizer': self.lam,
+                     'kernel_regularizer': l2(self.lam),
+                     'recurrent_regularizer': l2(self.lam),
                      'dropout': self.dropout_rate,
                      'recurrent_dropout': self.dropout_rate}
 
         dense_spec = {'units': self.n_bins,
                       'activation': 'softmax',
-                      'kernel_regularizer': self.lam}
-
-        encoder_input = Input(shape=(None, self.n_bins))
-        decoder_input = Input(shape=(None, self.n_bins))
-
-        encoder_fwd = neural_network_builder.build_lstm(lstm_spec)
-        lstm_spec['go_backwards'] = True
-        encoder_bkwd = neural_network_builder.build_lstm(lstm_spec)
-        _, h_fwd, C_fwd = encoder_fwd(encoder_input)
-        _, h_bkwd, C_bkwd = encoder_bkwd(encoder_input)
-
-        decoder_initial_states = [Average()([h_fwd, h_bkwd]), Average()([C_fwd, C_bkwd])]
-
-        lstm_spec['return_sequences'] = True
-        lstm_spec['go_backwards'] = False
-        decoder_lstm = neural_network_builder.build_lstm(lstm_spec)
-        decoder_output, _, _ = decoder_lstm(decoder_input, initial_state=decoder_initial_states)
-        decoder_dense = neural_network_builder.build_fully_connected(dense_spec)
-
-        if self.dropout_rate > 0.:
-            decoder_output = neural_network_builder.build_dropout(self.dropout_rate)(decoder_output)
-
-        decoded_sequence = decoder_dense(decoder_output)
-        self.__sequence2sequence = Model([encoder_input, decoder_input], decoded_sequence)
-
-        loss = 'categorical_crossentropy'
-        self.__sequence2sequence.compile(optimizer='nadam', loss=loss, metrics=[loss] + custom_objs)
-
-        self.predict_stochastic = K.function([encoder_input, decoder_input, K.learning_phase()],
-                                             [decoder_output])
-
-        self.__encoder = Model(encoder_input, decoder_initial_states)
-        self.predict_stochastic_encoder = K.function([encoder_input, K.learning_phase()],
-                                                     decoder_initial_states)
+                      'kernel_regularizer': l2(self.lam)}
 
         infr_init_h = Input(shape=(self.n_hidden,))
         infr_init_C = Input(shape=(self.n_hidden,))
 
-        decoder_output, infr_h, infr_C = decoder_lstm(decoder_input, initial_state=[infr_init_h, infr_init_C])
-        inferred_sequence = decoder_dense(decoder_output)
+        if self.n_channels > 1:
+            all_encoder_inputs = [Input(shape=(None, self.n_bins), name='encoder_channel_{}'.format(i + 1))
+                                  for i in range(self.n_channels)]
+            all_decoder_inputs = [Input(shape=(None, self.n_bins), name='decoder_channel_{}'.format(i + 1))
+                                  for i in range(self.n_channels)]
 
-        self.__decoder = Model([decoder_input, infr_init_h, infr_init_C],
-                               [inferred_sequence, infr_h, infr_C])
-        self.predict_stochastic_decoder = K.function([decoder_input, infr_init_h, infr_init_C, K.learning_phase()],
-                                                     [inferred_sequence, infr_h, infr_C])
+            encoder_input = Concatenate(axis=-1)(all_encoder_inputs)
+            decoder_input = Concatenate(axis=-1)(all_decoder_inputs)
+            train_inputs = all_encoder_inputs + all_decoder_inputs
+            encoder_predict_inputs = all_encoder_inputs + [K.learning_phase()]
+            decoder_predict_inputs = all_decoder_inputs + [infr_init_h, infr_init_C, K.learning_phase()]
+        else:
+            encoder_input = Input(shape=(None, self.n_bins))
+            decoder_input = Input(shape=(None, self.n_bins))
+            train_inputs = [encoder_input, decoder_input]
+            encoder_predict_inputs = [encoder_input, K.learning_phase()]
+            decoder_predict_inputs = [decoder_input, infr_init_h, infr_init_C, K.learning_phase()]
+
+        encoder_fwd = LSTM(**lstm_spec)
+        lstm_spec['go_backwards'] = True
+        encoder_bkwd = LSTM(**lstm_spec)
+
+        _, h_fwd, C_fwd = encoder_fwd(encoder_input)
+        _, h_bkwd, C_bkwd = encoder_bkwd(encoder_input)
+        decoder_initial_states = [Average()([h_fwd, h_bkwd]), Average()([C_fwd, C_bkwd])]
+
+        lstm_spec['return_sequences'] = True
+        lstm_spec['go_backwards'] = False
+        decoder_lstm = LSTM(**lstm_spec)
+        decoder_output, _, _ = decoder_lstm(decoder_input, initial_state=decoder_initial_states)
+        infr_decoder_output, infr_h, infr_C = decoder_lstm(decoder_input, initial_state=[infr_init_h, infr_init_C])
+
+        if self.dropout_rate > 0.:
+            decoder_output = Dropout(self.dropout_rate)(decoder_output)
+            infr_decoder_output = Dropout(self.dropout_rate)(infr_decoder_output)
+
+        if self.n_channels > 1:
+            train_outputs = []
+            decoder_predict_outputs = []
+
+            for i in range(self.n_channels):
+                decoder_dense = Dense(**dense_spec)
+                train_outputs += [decoder_dense(decoder_output)]
+                decoder_predict_outputs += [decoder_dense(infr_decoder_output)]
+
+            decoder_predict_outputs += [infr_h, infr_C]
+        else:
+            decoder_dense = Dense(**dense_spec)
+            decoded_sequence = decoder_dense(decoder_output)
+            train_outputs = [decoded_sequence]
+            infr_decoder_output, infr_h, infr_C = decoder_lstm(decoder_input, initial_state=[infr_init_h, infr_init_C])
+            inferred_sequence = decoder_dense(infr_decoder_output)
+            decoder_predict_outputs = [inferred_sequence, infr_h, infr_C]
+
+        self.__sequence2sequence = Model(train_inputs, train_outputs)
+        self.__sequence2sequence.compile(optimizer='nadam', loss=loss, metrics=[loss] + custom_objs)
+        self.__encoder = Model(encoder_predict_inputs[:-1], decoder_initial_states)
+        self.__decoder = Model(decoder_predict_inputs[:-1], decoder_predict_outputs)
+        self.predict_stochastic = K.function(train_inputs + [K.learning_phase()], train_outputs)
+        self.predict_stochastic_encoder = K.function(encoder_predict_inputs, decoder_initial_states)
+        self.predict_stochastic_decoder = K.function(decoder_predict_inputs, decoder_predict_outputs)
 
     def fit(self, train_frames, **kwargs):
         # type: (np.ndarray) -> None
         cp_fname = 'cp_{}'.format(''.join([random.choice('0123456789ABCDEF') for _ in range(16)]))
 
-        inputs = [train_frames[:, :self.lookback],
-                  train_frames[:, self.lookback:self.lookback + self.horizon]]
-        outputs = [train_frames[:, self.lookback + 1:self.lookback + self.horizon + 1]]
+        if train_frames.ndim > 3:
+            inputs = [train_frames[:, :self.lookback, :, i] for i in range(train_frames.shape[-1])] + \
+                     [train_frames[:, self.lookback:self.lookback + self.horizon, :, i]
+                      for i in range(train_frames.shape[-1])]
+            outputs = [train_frames[:, self.lookback + 1:self.lookback + self.horizon + 1, :, i]
+                       for i in range(train_frames.shape[-1])]
+        else:
+            inputs = [train_frames[:, :self.lookback], train_frames[:, self.lookback:self.lookback + self.horizon]]
+            outputs = [train_frames[:, self.lookback + 1:self.lookback + self.horizon + 1]]
 
         callbacks = [EarlyStopping(monitor='val_loss', min_delta=1e-3, patience=2, verbose=1, mode='min'),
                      ModelCheckpoint(cp_fname, monitor='val_loss', mode='min',
@@ -131,23 +159,38 @@ class MordredStrategy(ModelStrategy):
 
     def predict(self, inputs, predictive_horizon=100, mc_samples=100):
         samples = []
-        encoder_inputs = inputs[:, :self.lookback]
+        if inputs.ndim > 3:
+            encoder_inputs = [inputs[:, :self.lookback, :, i] for i in range(inputs.shape[3])]
+            first_decoder_seed = [inputs[:, self.lookback:self.lookback + 1, :, i] for i in range(inputs.shape[3])]
+        else:
+            encoder_inputs = [inputs[:, :self.lookback]]
+            first_decoder_seed = [inputs[:, self.lookback:self.lookback + 1]]
 
         for i_s in range(mc_samples):
-            decoder_seed = inputs[:, self.lookback:self.lookback + 1]
+            h, c = self.predict_stochastic_encoder(encoder_inputs + [True])
+            decoder_stochastic_output = self.predict_stochastic_decoder(first_decoder_seed + [h, c, True])
+            seq = [decoder_stochastic_output[:-2]]
 
-            h, c = self.predict_stochastic_encoder([encoder_inputs, True])
-            seq = []
+            for t in range(predictive_horizon-1):
+                decoder_stochastic_output = self.predict_stochastic_decoder(decoder_stochastic_output + [True])
+                seq += [decoder_stochastic_output[:-2]]
 
-            for t in range(predictive_horizon):
-                decoder_seed, h, c = self.predict_stochastic_decoder([decoder_seed, h, c, True])
-                seq += [decoder_seed]
+            samples += [np.stack(seq, axis=-1).T.squeeze()]
 
-            samples += [seq]
+        posterior_mean = np.stack(samples).mean(axis=0).squeeze()
+        drawn_samples = []
 
-        posterior_mean = np.array(samples).mean(axis=0).squeeze()
-        drawn_samples = [np.random.choice(self.n_bins, mc_samples, p=posterior_mean[t])
-                         for t in range(predictive_horizon)]
+        if self.n_channels > 1:
+            for i_ch in range(self.n_channels):
+                ch_posterior = posterior_mean.take(i_ch, axis=-1)
+                ch_samples = [np.random.choice(self.n_bins, mc_samples, p=ch_posterior[t])
+                                 for t in range(predictive_horizon)]
+                drawn_samples += [np.stack(ch_samples, axis=-1)]
+        else:
+            drawn_samples += [np.random.choice(self.n_bins, mc_samples, p=posterior_mean[t])
+                              for t in range(predictive_horizon)]
+
+        drawn_samples = np.stack(drawn_samples, axis=-1)
 
         return {'ordinal_pdf': posterior_mean, 'draws': drawn_samples}
 
@@ -155,9 +198,10 @@ class MordredStrategy(ModelStrategy):
         save_obj = {'ordinal_bins': self.n_bins,
                     'units': self.n_hidden,
                     'dropout_rate': self.dropout_rate,
-                    'lambda': self.lam,
+                    'lam': self.lam,
                     'lookback': self.lookback,
-                    'horizon': self.horizon}
+                    'horizon': self.horizon,
+                    'n_channels':self.n_channels}
 
         if fname is None:
             fname = MordredStrategy.get_filename(save_obj)
@@ -177,12 +221,13 @@ class MordredStrategy(ModelStrategy):
     @staticmethod
     def get_filename(model_spec):
         assert all([k in model_spec for k in MordredStrategy.required_spec_keys])
-        return 'mordred_{}_bins_{}_hidden_{}_dropout_{}_l2_lookback_{}_horizon_{}'.format(model_spec['ordinal_bins'],
-                                                                                          model_spec['units'],
-                                                                                          model_spec['dropout_rate'],
-                                                                                          model_spec['lambda'],
-                                                                                          model_spec['lookback'],
-                                                                                          model_spec['horizon'])
+        return 'mordred_{}_bins_{}_hidden_{}_dropout_{}_l2_lookback_{}_horizon_{}_channels_{}'.format(model_spec['ordinal_bins'],
+                                                                                                      model_spec['units'],
+                                                                                                      model_spec['dropout_rate'],
+                                                                                                      model_spec['lam'],
+                                                                                                      model_spec['lookback'],
+                                                                                                      model_spec['horizon'],
+                                                                                                      model_spec['n_channels'])
 
     @staticmethod
     def load(fname, custom_objs = None):
@@ -192,7 +237,7 @@ class MordredStrategy(ModelStrategy):
         if custom_objs is not None:
             spec['custom_objs'] = custom_objs
 
-        model = MordredStrategy(spec)
+        model = MordredStrategy(**spec)
         model.set_weights(spec['weights_fname'])
 
         return model
@@ -203,77 +248,63 @@ class MordredStrategy(ModelStrategy):
 
 
 class GPStrategy(ModelStrategy):
-    def __init__(self):
-        pass
+    """Implements the autoregressive Gaussian Process time series forecasting strategy."""
+    id = 'argp'
 
-    def load(fname): pass
-
-    def save(self, fname): pass
-
-    def fit(self, inputs, outputs, **kwargs): pass
-
-    def predict(self, inputs, horizon=100): pass
-
-    def draw_prediction_samples(self, inputs, n_samples=10): pass
-
-
-class GPyKernelBuilder:
-    def __init__(self, spec):
-        pass
-
-
-class KerasSequentialBuilder:
-    def __init__(self):
-        self.transformations = []
+    def __init__(self, ker, lookback=100, horizon=1, fname='tmp', n_channels=1):
+        self.ker = ker + gpy.kern.White(lookback)
+        self.lookback = lookback
+        self.horizon = horizon
+        self.fname = 'gp_{}'.format(fname)  # TODO: DEFINE KERNEL STR
         self.model = None
 
-    def build_lstm(self, spec):
-        # type: (dict) -> keras.layers.Layer
-        if 'kernel_regularizer' in spec and type(spec['kernel_regularizer']) is float:
-            spec['kernel_regularizer'] = l2(spec['kernel_regularizer'])
-        if 'recurrent_regularizer' in spec and type(spec['recurrent_regularizer']) is float:
-            spec['recurrent_regularizer'] = l2(spec['recurrent_regularizer'])
-        if 'bidirectional_merge_mode' in spec:
-            bidirectional_merge_mode = spec['bidirectional_merge_mode']
-            spec.pop('bidirectional_merge_mode')
+    @staticmethod
+    def load(fname):
+        with open(fname, 'r') as f:
+            obj = pickle.load(f)
+        return obj
+
+    def save(self, folder, fname=None):
+        if fname is None:
+            fname = self.fname
+
+        with open(folder + fname, 'wb') as f:
+            pickle.dump(self, f)
+
+    def fit(self, train_frames, restarts=1):
+        self.model = gpy.models.GPRegression(train_frames[:, :self.lookback, 0],  # TODO: attractor compatibility
+                                             train_frames[:, self.lookback:self.lookback+1, 0],
+                                             self.ker)
+
+        if restarts > 1:
+            self.model.optimize_restarts(restarts)
         else:
-            bidirectional_merge_mode = None
+            self.model.optimize()
 
-        new_layer = LSTM(**spec)
+    def predict(self, inputs, predictive_horizon=100, mc_samples=100):
+        pred_inputs = inputs[:, :, 0]
+        assert pred_inputs.ndim == 2  # TODO: reshape for attractor compatibility
+        assert self.model is not None
 
-        if bidirectional_merge_mode is not None:
-            new_layer = Bidirectional(new_layer, merge_mode=bidirectional_merge_mode)
+        pred_mean, pred_var = self.model.predict(pred_inputs)
+        pred_sigma = np.sqrt(pred_var)
 
-        self.transformations += [new_layer]
-        return new_layer
+        samples = np.random.normal(loc=pred_mean, scale=pred_sigma, size=(mc_samples, 1))
+        draws = np.hstack((np.repeat(pred_inputs, axis=0, repeats=mc_samples), samples))
 
-    def build_fully_connected(self, spec):
-        # type: (dict) -> keras.layers.Layer
-        if 'kernel_regularizer' in spec and type(spec['kernel_regularizer']) is float:
-            spec['kernel_regularizer'] = l2(spec['kernel_regularizer'])
+        for i in range(predictive_horizon - 1):
+            pred_mu, pred_var = self.model.predict_noiseless(draws[:, -self.seed_length:])
+            pred_sigma = np.sqrt(pred_var).clip(0.) # TODO: sigma greater than 0
+            samples = np.random.normal(loc=pred_mu, scale=pred_sigma)
+            draws = np.hstack((draws, samples))
 
-        new_layer = Dense(**spec)
+        return {'draws': draws[:, self.seed_length:]}  # TODO: attractor compatibility
 
-        self.transformations += [new_layer]
-        return new_layer
+    @staticmethod
+    def get_filename(params):
+        # type: (dict) -> str
+        return 'gp_{}'.format(params.get('fname', 'tmp'))
 
-    def build_dropout(self, dropout_rate):
-        new_layer = Dropout(dropout_rate)
-        self.transformations += [new_layer]
-
-        return new_layer
-
-    def add_layer(self, layer_spec):
-        # type: (str, dict) -> keras.layers.Layer
-        layer_type = layer_spec['type']
-        layer_spec.pop('type')
-        if layer_type == 'lstm': return self.build_lstm(layer_spec)
-        elif layer_type == 'dense': return self.build_fully_connected(layer_spec)
-        elif layer_type == 'activation': return self.build_activation(layer_spec)
-        else: 'Layer type {} not supported'.format(layer_type)
-
-    def assemble_sequential_network(self, **compile_args):
-        # type: () -> keras.Model
-        if self.model is None: self.model = Sequential(self.transformations)
-        self.model.compile(compile_args)
-        return self.model
+    @property
+    def seed_length(self):
+        return self.lookback

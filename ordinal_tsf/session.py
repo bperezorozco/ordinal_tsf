@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 
 
 class Session:
-    """This is the director of all experiments done with a single dataset
+    """This is the director of all experiments made with a single dataset.
 
     All raw time series are associated to a single session, which manages the logs, predictions, plots and reports
     of different forecasting strategies and dataset representations (real-valued, ordinal, stacked, etc.)"""
@@ -46,7 +46,6 @@ class Session:
 
 class StrategyExperiment:
     """This manages a strategy's fitting, hyperparameter selection and evaluation.
-
     This acts as a directory handler that queries, stores and manages the different products of an experiment:
     parameter fitting, hyperparameter selection, model evaluation and plot generation."""
     def __init__(self, dataset, folder, StrategyClass):
@@ -71,7 +70,6 @@ class StrategyExperiment:
     def choose_model(self, tests, hypergrid_keys, expanded_hypergrid, prediction_index,
                      predictive_horizon, plots=[], fit_kwargs={}, eval_kwargs={}, mode='val'):
         """Executes the model selection and evaluation pipeline
-
         Args:
             tests (List[TestDefinition]): criteria and targets used to evaluate predictions
             hypergrid_keys (List[str]): names of the Strategy's attributes
@@ -100,17 +98,14 @@ class StrategyExperiment:
             prediction_fname = self.folder + 'predictions/' + fname \
                              + '_{}_pred_index_{}_pred_horizon_{}'.format(mode, prediction_index, predictive_horizon)
 
-            files_exist = os.path.isfile(spec_fname) and os.path.isfile(prediction_fname)
-            produce_forecast = True
-
-            if files_exist:
+            if os.path.isfile(spec_fname):
                 with open(spec_fname, 'r') as f:
                     spec = pickle.load(f)
 
-                if all([test.metric in spec.keys() for test in tests]):
-                    produce_forecast = False
-
-            if produce_forecast:
+            if os.path.isfile(prediction_fname):
+                with open(prediction_fname, 'rb') as f:
+                    prediction = pickle.load(f)
+            else:
                 if os.path.isfile(model_fname):
                     model = self.Strategy.load(model_fname)
                 else:
@@ -130,24 +125,22 @@ class StrategyExperiment:
                                            **eval_kwargs)
                 prediction = self.build_prediction(prediction)
 
-                for test in tests:
-                    spec[test.metric] = test.eval(prediction)
-
                 with open(prediction_fname, 'wb') as f:
                     pickle.dump(prediction, f)
-                with open(spec_fname, 'wb') as f:
-                    pickle.dump(spec, f)
-            else:
-                with open(prediction_fname, 'r') as f:
-                    prediction = pickle.load(f)
 
             for test in tests:
                 metric = test.metric
+                if metric not in spec:
+                    spec[metric] = test.eval(prediction)
+
                 if test.compare(spec[metric], best_results[metric]) or best_results[metric] is None:
                     print 'NEW BEST MODEL'
                     print metric, spec[metric]
                     best_strategy[metric] = spec
                     best_results[metric] = spec[metric]
+
+            with open(spec_fname, 'wb') as f:
+                pickle.dump(spec, f)
 
             for plot_key, plot_args in plots.items():
                 plot_eval = getattr(prediction, plot_key, None)

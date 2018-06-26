@@ -11,7 +11,7 @@ import random
 import os
 
 
-class ModelStrategy:
+class ModelStrategy(object):
     """Provides a common interface for the forecasting strategy to be used at runtime."""
     __metaclass__ = ABCMeta
     filename = 'tmp_'
@@ -44,7 +44,7 @@ class MordredStrategy(ModelStrategy):
 
     def __init__(self, ordinal_bins=85, units=64, dropout_rate=0.25, lam=1e-9,
                  lookback=100, horizon=100, n_channels=1, custom_objs=[]):
-        # type: (dict) -> None
+        # type: (int, int, float, float, int, int, int, list) -> None
         self.n_bins = ordinal_bins
         self.n_hidden = units
         self.dropout_rate = dropout_rate
@@ -237,8 +237,16 @@ class MordredStrategy(ModelStrategy):
         if custom_objs is not None:
             spec['custom_objs'] = custom_objs
 
+        if 'lambda' in spec:
+            l = spec.pop('lambda', 0.)
+            spec['lam'] = l
+
+        weights_fname = spec.pop('weights_fname', None)
+        #print weights_fname
+        assert weights_fname is not None, "Provide a valid weights filename to load model."
+
         model = MordredStrategy(**spec)
-        model.set_weights(spec['weights_fname'])
+        model.set_weights(weights_fname)
 
         return model
 
@@ -272,8 +280,9 @@ class GPStrategy(ModelStrategy):
             pickle.dump(self, f)
 
     def fit(self, train_frames, restarts=1):
-        self.model = gpy.models.GPRegression(train_frames[:, :self.lookback, 0],  # TODO: attractor compatibility
-                                             train_frames[:, self.lookback:self.lookback+1, 0],
+        MAX_LENGTH = 10000
+        self.model = gpy.models.GPRegression(train_frames[:MAX_LENGTH, :self.lookback, 0],  # TODO: attractor compatibility
+                                             train_frames[:MAX_LENGTH, self.lookback:self.lookback+1, 0],
                                              self.ker)
 
         if restarts > 1:
@@ -293,8 +302,8 @@ class GPStrategy(ModelStrategy):
         draws = np.hstack((np.repeat(pred_inputs, axis=0, repeats=mc_samples), samples))
 
         for i in range(predictive_horizon - 1):
-            pred_mu, pred_var = self.model.predict_noiseless(draws[:, -self.seed_length:])
-            pred_sigma = np.sqrt(pred_var).clip(0.) # TODO: sigma greater than 0
+            pred_mu, pred_var = self.model.predict(draws[:, -self.seed_length:])
+            pred_sigma = np.sqrt(pred_var)#.clip(0.) # TODO: sigma greater than 0
             samples = np.random.normal(loc=pred_mu, scale=pred_sigma)
             draws = np.hstack((draws, samples))
 

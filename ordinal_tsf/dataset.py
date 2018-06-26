@@ -8,7 +8,7 @@ import seaborn as sns
 from scipy.stats import norm
 
 
-class Dataset:
+class Dataset(object):
     """Handler for a time series dataset and its different representations."""
     train_ts = None
     val_ts = None
@@ -113,7 +113,7 @@ class Dataset:
         return ts
 
 
-class DatasetPreprocessingStep:
+class DatasetPreprocessingStep(object):
     """Provides a common interface for the individual transformations of the dataset preprocessing pipeline
 
     Attributes:
@@ -231,7 +231,7 @@ class Selector(DatasetPreprocessingStep):
         return ts[self.start:self.end]
 
 
-class Prediction:
+class Prediction(object):
     """Provides a common interface for the output predictions of different forecasting strategies    """
     __metaclass__ = ABCMeta
     type = 'deterministic'
@@ -287,6 +287,13 @@ class OrdinalPrediction(Prediction):
         neg_log_p_ground_truth = -np.log(p_ground_truth)
         return neg_log_p_ground_truth.sum()
 
+    def cum_nll(self, binned_ground_truth):
+        """Computes integral of NLL(t) of drawing a time series from a piecewise uniform sequential prediction"""
+        # type: (np.ndarray) -> np.float
+        p_ground_truth = (self.ordinal_pdf * binned_ground_truth / self.delta).max(axis=-1)
+        neg_log_p_ground_truth = -np.log(p_ground_truth)
+        return neg_log_p_ground_truth.cumsum().sum()
+
     def get_quantile(self, alpha):
         """Computes \alpha-quantiles given the object's ordinal pdf"""
         # type: (np.ndarray) -> np.float
@@ -309,6 +316,15 @@ class OrdinalPrediction(Prediction):
         """Plots the full ordinal pdf as a heatmap"""
         plt.imshow(self.ordinal_pdf.T, cmap=ListedColormap(sns.color_palette("RdBu_r", 500).as_hex()),
                    origin='lower', aspect='auto')
+
+    def plot_cum_nll(self, plt, binned_ground_truth):
+        """Plots the full ordinal pdf as a heatmap"""
+        p_ground_truth = (self.ordinal_pdf * binned_ground_truth / self.delta).max(axis=-1)
+        neg_log_p_ground_truth = -np.log(p_ground_truth)
+        cum_nll = neg_log_p_ground_truth.cumsum()
+
+        plt.plot(cum_nll)
+        plt.title('Cumulative negative log likelihood')
 
     def plot_log_like(self, plt):
         """Plots the full log ordinal pdf as a heatmap"""
@@ -350,7 +366,21 @@ class GaussianPrediction(Prediction):
         likelihood = np.array([norm(loc=self.posterior_mean[i], scale=self.posterior_std[i]).pdf(ground_truth[i])
                                for i in range(horizon)])
 
-        print 'NLL: {}'.format(-np.log(likelihood).sum())
+        nll = -np.log(likelihood).sum()
+        print 'NLL: {}'.format(nll)
+        return nll
+
+    def cum_nll(self, ground_truth):
+        """Computes compulative NLL of drawing a time series from a GP sequential prediction"""
+        # type: (np.ndarray) -> np.float
+        horizon = self.posterior_mean.shape[0]
+        likelihood = np.array([norm(loc=self.posterior_mean[i], scale=self.posterior_std[i]).pdf(ground_truth[i])
+                               for i in range(horizon)])
+
+        nll = -np.log(likelihood).cumsum().sum()
+        print 'Cum NLL: {}'.format(nll)
+        return nll
+
 
     def plot_median_2std(self, plt, ground_truth):
         """Plots a probabilistic forecast's median and 2.5, 97.5 quantiles alongside the corresponding ground truth"""
@@ -365,7 +395,7 @@ class GaussianPrediction(Prediction):
         plt.legend(['Quantile 0.025', 'Quantile 0.975', 'Median', 'True'])
 
 
-class TestDefinition:
+class TestDefinition(object):
     """Defines a ground truth and a metric to evaluate predictions on.
 
     By defining a sequence of tests, we

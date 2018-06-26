@@ -28,7 +28,7 @@ mordred_search_space = {'lam': [1e-6, 1e-7, 1e-8],
 
 train_spec = {'epochs': 50, 'batch_size': 256, 'validation_split': 0.15}
 
-for DS in ['webtsslp', 'webtsair', 'EMexptqp2', 'EMlorenz', 'air', 'mg', 'heart', 'tide']:
+for DS in ['mg', 'webtsslp', 'webtsair', 'EMexptqp2', 'EMlorenz', 'air', 'heart', 'tide']:
     sess = Session('{}'.format(DS))
     VALIDATION_START_INDEX = LOOKBACK + 2 * ATTRACTOR_LAG + DECODER_SEED_LENGTH
     TEST_START_INDEX = LOOKBACK + 2 * ATTRACTOR_LAG + DECODER_SEED_LENGTH
@@ -39,7 +39,9 @@ for DS in ['webtsslp', 'webtsair', 'EMexptqp2', 'EMlorenz', 'air', 'mg', 'heart'
     white_noise = WhiteCorrupter()
     att_stacker = AttractorStacker(10)
 
-    dataset = Dataset(x, LOOKBACK + HORIZON + DECODER_SEED_LENGTH, p_val=0.15, p_test=0.15, preprocessing_steps=[stand, quant])
+    dataset = Dataset(x, LOOKBACK + HORIZON + DECODER_SEED_LENGTH,
+                      p_val=0.15, p_test=0.15, preprocessing_steps=[stand, quant])
+
     if dataset.optional_params.get('is_attractor', False):
         EFFECTIVE_LAG = 2*ATTRACTOR_LAG
 
@@ -51,8 +53,11 @@ for DS in ['webtsslp', 'webtsair', 'EMexptqp2', 'EMlorenz', 'air', 'mg', 'heart'
     ordinal_ground_truth = dataset.apply_partial_preprocessing('val', [selector, stand, quant])
 
     validation_tests = [TestDefinition('mse', continuous_ground_truth),
-                        TestDefinition('nll', ordinal_ground_truth)]
+                        TestDefinition('nll', ordinal_ground_truth),
+                        TestDefinition('cum_nll', ordinal_ground_truth)]
+
     validation_plots = {'plot_median_2std': {'ground_truth':continuous_ground_truth},
+                        'plot_cum_nll': {'binned_ground_truth': ordinal_ground_truth},
                         'plot_like': {}}
 
     experiment = sess.start_experiment(dataset, MordredStrategy)
@@ -76,6 +81,7 @@ for DS in ['webtsslp', 'webtsair', 'EMexptqp2', 'EMlorenz', 'air', 'mg', 'heart'
     final_tests = [TestDefinition('mse', continuous_ground_truth),
                    TestDefinition('nll', ordinal_ground_truth)]
     test_plots = {'plot_median_2std': {'ground_truth': continuous_ground_truth},
+                  'plot_cum_nll': {'binned_ground_truth': ordinal_ground_truth},
                   'plot_like': {}}
 
     for metric, best_model in best_models[DS].items():
@@ -93,4 +99,3 @@ for DS in ['webtsslp', 'webtsair', 'EMexptqp2', 'EMlorenz', 'air', 'mg', 'heart'
 print best_models
 
 exit()
-

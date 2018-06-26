@@ -8,7 +8,7 @@ import GPy as gpy
 os.environ["CUDA_VISIBLE_DEVICES"]="5"
 
 
-MAX_LENGTH = 10000
+MAX_LENGTH = 30000
 TS_X = 100
 TS_Y = 100
 LOOKBACK = 100
@@ -27,7 +27,7 @@ train_spec = {}
 VALIDATION_START_INDEX = LOOKBACK + 2 * ATTRACTOR_LAG + 1
 TEST_START_INDEX = LOOKBACK + 2 * ATTRACTOR_LAG + 1
 
-for DS in ['mg']:
+for DS in ['webtsslp', 'EMexptqp2']:
     sess = Session('{}'.format(DS))
     x = pd.read_feather('../ds/{}.feather'.format(DS)).values[:MAX_LENGTH]
     stand = Standardiser()

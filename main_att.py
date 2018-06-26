@@ -27,7 +27,7 @@ mordred_search_space = {'lam': [1e-6, 1e-7, 1e-8],
 
 train_spec = {'epochs': 50, 'batch_size': 256, 'validation_split': 0.15}
 
-for DS in ['webtsslp', 'webtsair', 'EMexptqp2', 'EMlorenz', 'air', 'mg', 'heart', 'tide']:
+for DS in ['mg', 'webtsslp', 'webtsair', 'EMexptqp2', 'EMlorenz', 'air', 'heart', 'tide']:
     sess = Session('{}'.format(DS))
     VALIDATION_START_INDEX = LOOKBACK + 2 * ATTRACTOR_LAG + 1
     TEST_START_INDEX = LOOKBACK + 2 * ATTRACTOR_LAG + 1
@@ -47,7 +47,8 @@ for DS in ['webtsslp', 'webtsair', 'EMexptqp2', 'EMlorenz', 'air', 'mg', 'heart'
     continuous_ground_truth = dataset.apply_partial_preprocessing('val', [selector, stand])
     ordinal_ground_truth = dataset.apply_partial_preprocessing('val', [selector, stand, quant])
     validation_tests = [TestDefinition('mse', continuous_ground_truth),
-                        TestDefinition('nll', ordinal_ground_truth)]
+                        TestDefinition('nll', ordinal_ground_truth),
+                        TestDefinition('cum_nll', ordinal_ground_truth)]
     validation_plots = {'plot_median_2std': {'ground_truth':continuous_ground_truth},
                         'plot_like': {}}
 

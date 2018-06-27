@@ -122,7 +122,6 @@ class MordredStrategy(ModelStrategy):
             decoder_dense = Dense(**dense_spec)
             decoded_sequence = decoder_dense(decoder_output)
             train_outputs = [decoded_sequence]
-            infr_decoder_output, infr_h, infr_C = decoder_lstm(decoder_input, initial_state=[infr_init_h, infr_init_C])
             inferred_sequence = decoder_dense(infr_decoder_output)
             decoder_predict_outputs = [inferred_sequence, infr_h, infr_C]
 
@@ -246,6 +245,171 @@ class MordredStrategy(ModelStrategy):
         assert weights_fname is not None, "Provide a valid weights filename to load model."
 
         model = MordredStrategy(**spec)
+        model.set_weights(weights_fname)
+
+        return model
+
+    @property
+    def seed_length(self):
+        return self.lookback + 1
+
+
+class ContinuousSeq2Seq(ModelStrategy):
+    """Implements the ordinal sequence-to-sequence time series forecasting strategy."""
+    required_spec_keys = ['units', 'dropout_rate', 'lam', 'horizon', 'lookback']
+    id = 'seq2seq'
+
+    def __init__(self, units=64, dropout_rate=0.25, lam=1e-9,
+                 lookback=100, horizon=100, n_channels=1, custom_objs=[]):
+        # type: (int, float, float, int, int, int, list) -> None
+        self.n_hidden = units
+        self.dropout_rate = dropout_rate
+        self.lam = lam
+        self.lookback = lookback
+        self.horizon = horizon
+        self.n_channels = n_channels
+        self.filename = 'contseq2seq_{}_hidden_{}_dropout_{}_l2_lookback_{}_horizon_{}_channels_{}'.format(
+                        self.n_hidden, self.dropout_rate, self.lam, self.lookback, self.horizon, self.n_channels)
+
+        loss = 'mse'
+        custom_objs = custom_objs
+
+        lstm_spec = {'units': self.n_hidden,
+                     'return_state': True,
+                     'kernel_regularizer': l2(self.lam),
+                     'recurrent_regularizer': l2(self.lam),
+                     'dropout': self.dropout_rate,
+                     'recurrent_dropout': self.dropout_rate}
+
+        dense_spec = {'units': self.n_channels,
+                      'activation': 'linear',
+                      'kernel_regularizer': l2(self.lam)}
+
+        infr_init_h = Input(shape=(self.n_hidden,))
+        infr_init_C = Input(shape=(self.n_hidden,))
+
+        encoder_input = Input(shape=(None, self.n_channels))
+        decoder_input = Input(shape=(None, self.n_channels))
+        train_inputs = [encoder_input, decoder_input]
+        encoder_predict_inputs = [encoder_input, K.learning_phase()]
+        decoder_predict_inputs = [decoder_input, infr_init_h, infr_init_C, K.learning_phase()]
+
+        encoder_fwd = LSTM(**lstm_spec)
+        lstm_spec['go_backwards'] = True
+        encoder_bkwd = LSTM(**lstm_spec)
+
+        _, h_fwd, C_fwd = encoder_fwd(encoder_input)
+        _, h_bkwd, C_bkwd = encoder_bkwd(encoder_input)
+        decoder_initial_states = [Average()([h_fwd, h_bkwd]), Average()([C_fwd, C_bkwd])]
+
+        lstm_spec['return_sequences'] = True
+        lstm_spec['go_backwards'] = False
+        decoder_lstm = LSTM(**lstm_spec)
+        decoder_output, _, _ = decoder_lstm(decoder_input, initial_state=decoder_initial_states)
+        infr_decoder_output, infr_h, infr_C = decoder_lstm(decoder_input, initial_state=[infr_init_h, infr_init_C])
+
+        if self.dropout_rate > 0.:
+            decoder_output = Dropout(self.dropout_rate)(decoder_output)
+            infr_decoder_output = Dropout(self.dropout_rate)(infr_decoder_output)
+
+        decoder_dense = Dense(**dense_spec)
+        decoded_sequence = decoder_dense(decoder_output)
+        train_outputs = [decoded_sequence]
+        inferred_sequence = decoder_dense(infr_decoder_output)
+        decoder_predict_outputs = [inferred_sequence, infr_h, infr_C]
+
+        self.__sequence2sequence = Model(train_inputs, train_outputs)
+        self.__sequence2sequence.compile(optimizer='nadam', loss=loss, metrics=[loss] + custom_objs)
+        self.__encoder = Model(encoder_predict_inputs[:-1], decoder_initial_states)
+        self.__decoder = Model(decoder_predict_inputs[:-1], decoder_predict_outputs)
+        self.predict_stochastic = K.function(train_inputs + [K.learning_phase()], train_outputs)
+        self.predict_stochastic_encoder = K.function(encoder_predict_inputs, decoder_initial_states)
+        self.predict_stochastic_decoder = K.function(decoder_predict_inputs, decoder_predict_outputs)
+
+    def fit(self, train_frames, **kwargs):
+        # type: (np.ndarray) -> None
+        cp_fname = 'cp_{}'.format(''.join([random.choice('0123456789ABCDEF') for _ in range(16)]))
+
+        inputs = [train_frames[:, :self.lookback], train_frames[:, self.lookback:self.lookback + self.horizon]]
+        outputs = [train_frames[:, self.lookback + 1:self.lookback + self.horizon + 1]]
+
+        callbacks = [EarlyStopping(monitor='val_loss', min_delta=1e-3, patience=2, verbose=1, mode='min'),
+                     ModelCheckpoint(cp_fname, monitor='val_loss', mode='min',
+                                     save_best_only=True,
+                                     save_weights_only=True)]
+
+        self.__sequence2sequence.fit(inputs, outputs, verbose=2, callbacks=callbacks, **kwargs)
+        self.__sequence2sequence.load_weights(cp_fname)
+        os.remove(cp_fname)
+
+    def predict(self, inputs, predictive_horizon=100, mc_samples=100):
+        samples = []
+        encoder_inputs = [inputs[:, :self.lookback]]
+        first_decoder_seed = [inputs[:, self.lookback:self.lookback + 1]]
+
+        for i_s in range(mc_samples):
+            h, c = self.predict_stochastic_encoder(encoder_inputs + [True])
+            decoder_stochastic_output = self.predict_stochastic_decoder(first_decoder_seed + [h, c, True])
+            seq = [decoder_stochastic_output[:-2]]
+
+            for t in range(predictive_horizon-1):
+                decoder_stochastic_output = self.predict_stochastic_decoder(decoder_stochastic_output + [True])
+                seq += [decoder_stochastic_output[:-2]]
+
+            samples += [np.stack(seq, axis=-1).T.squeeze()]
+
+        return {'draws': np.stack(samples)}
+
+    def save(self, folder, fname=None):
+        save_obj = {'units': self.n_hidden,
+                    'dropout_rate': self.dropout_rate,
+                    'lam': self.lam,
+                    'lookback': self.lookback,
+                    'horizon': self.horizon,
+                    'n_channels':self.n_channels}
+
+        if fname is None:
+            fname = ContinuousSeq2Seq.get_filename(save_obj)
+
+        fname = folder + fname
+        weights_fname = fname + '_weights.h5'
+
+        save_obj['weights_fname'] = weights_fname
+        self.__sequence2sequence.save_weights(weights_fname, overwrite=True)
+
+        with open(fname, 'wb') as f:
+            pickle.dump(save_obj, f)
+
+    def set_weights(self, weights_fname):
+        self.__sequence2sequence.load_weights(weights_fname)
+
+    @staticmethod
+    def get_filename(model_spec):
+        assert all([k in model_spec for k in ContinuousSeq2Seq.required_spec_keys])
+        return 'seq2seq_{}_hidden_{}_dropout_{}_l2_lookback_{}_horizon_{}_channels_{}'.format(model_spec['units'],
+                                                                                              model_spec['dropout_rate'],
+                                                                                              model_spec['lam'],
+                                                                                              model_spec['lookback'],
+                                                                                              model_spec['horizon'],
+                                                                                              model_spec['n_channels'])
+
+    @staticmethod
+    def load(fname, custom_objs = None):
+        with open(fname, 'r') as f:
+            spec = pickle.load(f)
+
+        if custom_objs is not None:
+            spec['custom_objs'] = custom_objs
+
+        if 'lambda' in spec:
+            l = spec.pop('lambda', 0.)
+            spec['lam'] = l
+
+        weights_fname = spec.pop('weights_fname', None)
+        #print weights_fname
+        assert weights_fname is not None, "Provide a valid weights filename to load model."
+
+        model = ContinuousSeq2Seq(**spec)
         model.set_weights(weights_fname)
 
         return model

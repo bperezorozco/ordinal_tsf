@@ -381,6 +381,16 @@ class GaussianPrediction(Prediction):
         print 'Cum NLL: {}'.format(nll)
         return nll
 
+    def plot_cum_nll(self, plt, ground_truth):
+        """Computes compulative NLL of drawing a time series from a GP sequential prediction"""
+        # type: (np.ndarray) -> np.float
+        horizon = self.posterior_mean.shape[0]
+        likelihood = np.array([norm(loc=self.posterior_mean[i], scale=self.posterior_std[i]).pdf(ground_truth[i])
+                               for i in range(horizon)])
+
+        nll = -np.log(likelihood).cumsum()
+        plt.plot(nll)
+        plt.title('Cumulative negative log likelihood')
 
     def plot_median_2std(self, plt, ground_truth):
         """Plots a probabilistic forecast's median and 2.5, 97.5 quantiles alongside the corresponding ground truth"""

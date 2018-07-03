@@ -1,10 +1,19 @@
 import os
 import pandas as pd
+import pickle
 from ordinal_tsf.model import MordredStrategy
 from ordinal_tsf.dataset import Dataset, Quantiser, Standardiser, WhiteCorrupter, AttractorStacker, Selector, TestDefinition
 from ordinal_tsf.session import Session
 from ordinal_tsf.util import cartesian
 os.environ["CUDA_VISIBLE_DEVICES"]="4"
+
+import tensorflow as tf
+from keras.backend.tensorflow_backend import set_session
+config = tf.ConfigProto()
+#config.gpu_options.allow_growth = True
+config.gpu_options.per_process_gpu_memory_fraction = 0.6
+#config.gpu_options.visible_device_list = "4"
+set_session(tf.Session(config=config))
 
 
 MAX_LENGTH = 30000
@@ -28,14 +37,19 @@ mordred_search_space = {'lam': [1e-6, 1e-7, 1e-8],
 
 train_spec = {'epochs': 50, 'batch_size': 256, 'validation_split': 0.15}
 
-for DS in ['mg', 'webtsslp', 'webtsair', 'EMexptqp2', 'EMlorenz', 'air', 'heart', 'tide']:
+ALL_DS = []
+with open('fnames.txt', 'r') as f:
+    ALL_DS = [str(l).strip() for l in f]
+
+for FNAME in ALL_DS:
+    DS = FNAME[:-8]
     sess = Session('{}'.format(DS))
     VALIDATION_START_INDEX = LOOKBACK + 2 * ATTRACTOR_LAG + DECODER_SEED_LENGTH
     TEST_START_INDEX = LOOKBACK + 2 * ATTRACTOR_LAG + DECODER_SEED_LENGTH
 
-    x = pd.read_feather('../ds/{}.feather'.format(DS)).values[:MAX_LENGTH]
+    x = pd.read_feather('WebTS/{}'.format(FNAME)).values[:MAX_LENGTH]
     stand = Standardiser()
-    quant = Quantiser(85)
+    quant = Quantiser()
     white_noise = WhiteCorrupter()
     att_stacker = AttractorStacker(10)
 
@@ -98,4 +112,6 @@ for DS in ['mg', 'webtsslp', 'webtsair', 'EMexptqp2', 'EMlorenz', 'air', 'heart'
 
 print best_models
 
+with open('best_models', 'wb') as f:
+    pickle.dump(best_models, f)
 exit()

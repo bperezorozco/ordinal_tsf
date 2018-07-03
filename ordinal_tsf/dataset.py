@@ -1,12 +1,12 @@
 from abc import ABCMeta, abstractmethod
 from sklearn.metrics import mean_squared_error
 from matplotlib.colors import ListedColormap
-from util import assert_sum_one, all_satisfy, frame_ts, is_univariate
+from util import assert_sum_one, all_satisfy, frame_ts, is_univariate, frame_generator
 import pickle
 import numpy as np
 import seaborn as sns
 from scipy.stats import norm
-
+from functools import partial
 
 class Dataset(object):
     """Handler for a time series dataset and its different representations."""
@@ -36,9 +36,14 @@ class Dataset(object):
 
             self.optional_params.update(step.param_dict)
 
-        self.train_frames = frame_ts(self.train_ts, frame_length)
-        self.val_frames = frame_ts(self.val_ts, frame_length)
-        self.test_frames = frame_ts(self.test_ts, frame_length)
+        if self.optional_params.get('frame_generator', False):
+            self.train_frames = partial(frame_generator, ts=self.train_ts, frame_length=frame_length)
+            self.val_frames = partial(frame_generator, ts=self.train_ts, frame_length=frame_length)
+            self.test_frames = partial(frame_generator, ts=self.train_ts, frame_length=frame_length)
+        else:
+            self.train_frames = frame_ts(self.train_ts, frame_length)
+            self.val_frames = frame_ts(self.val_ts, frame_length)
+            self.test_frames = frame_ts(self.test_ts, frame_length)
 
     def save(self, fname):
         tmp = [self.train_frames, self.val_frames, self.test_frames]
@@ -190,20 +195,31 @@ class Quantiser(DatasetPreprocessingStep):
         ts_min = ts.min()
 
         if self.n_bins is None:
-            self.n_bins = self.__find_n_bins(ts_max, ts_min)
+            self.n_bins = self.__find_n_bins(ts)
 
         self.bins = np.linspace(ts_min, ts_max, self.n_bins)
 
         self.param_dict = {'bins': self.bins,
                            'bin_delta':self.bins[1]-self.bins[0],
-                           'is_ordinal': True}
+                           'is_ordinal': True,
+                           'frame_generator': True}
 
         self.is_fitted = True
 
-    def __find_n_bins(self, ts_max, ts_min):
+    def __find_n_bins(self, ts):
+        # type: (np.ndarray) -> int
+        MAX_ALLOWED = 300
+        MIN_ALLOWED = 50
+        n_bins = np.unique(ts.squeeze()).shape[0]
+
+        if n_bins < MAX_ALLOWED and n_bins > MIN_ALLOWED:
+            return n_bins
+
+        ts_max = ts.max()
+        ts_min = ts.min()
         n_bins = int((ts_max - ts_min) / self.delta)
-        n_bins = max(min(300, n_bins), 80)
-        print n_bins
+        n_bins = max(min(MAX_ALLOWED, n_bins), MIN_ALLOWED)
+
         return n_bins
 
 
@@ -408,12 +424,12 @@ class GaussianPrediction(Prediction):
 class TestDefinition(object):
     """Defines a ground truth and a metric to evaluate predictions on.
 
-    By defining a sequence of tests, we
+    Sequences of tests can be provided and reused across different model strategies, which guarantees result consistency.
 
     Args:
         metric_key (str): Name of the metric method to invoke on the provided predictions
         ground_truth (np.ndarray): True time series to compare forecasts with under the provided metric
-        compare (function):
+        compare (function): Function to compare metrics (e.g. ascending or descending)
     """
 
     def __init__(self, metric_key, ground_truth, compare=None):

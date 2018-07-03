@@ -9,6 +9,7 @@ import numpy as np
 import GPy as gpy
 import random
 import os
+from functools import partial
 
 
 class ModelStrategy(object):
@@ -134,25 +135,45 @@ class MordredStrategy(ModelStrategy):
         self.predict_stochastic_decoder = K.function(decoder_predict_inputs, decoder_predict_outputs)
 
     def fit(self, train_frames, **kwargs):
-        # type: (np.ndarray) -> None
+        batch_size = kwargs.get('batch_size', 256)
+        val_p = kwargs.get('validation_split', 0.15)
+        epochs = kwargs.get('epochs', 50)
+
+        def get_inputs(x):
+            if x.ndim > 3:
+                return [x[:, :self.lookback, :, i] for i in range(x.shape[-1])] + \
+                       [x[:, self.lookback:self.lookback + self.horizon, :, i]
+                        for i in range(x.shape[-1])]
+            else:
+                return [x[:, :self.lookback], x[:, self.lookback:self.lookback + self.horizon]]
+
+        def get_outputs(x):
+            if x.ndim > 3:
+                return [x[:, self.lookback + 1:self.lookback + self.horizon + 1, :, i]
+                        for i in range(x.shape[-1])]
+            else:
+                return [x[:, self.lookback + 1:self.lookback + self.horizon + 1]]
+
+        train_gen, val_gen, tr_steps, val_steps = train_frames(get_inputs=get_inputs, get_outputs=get_outputs,
+                                                               batch_size=batch_size, val_p=val_p)
+
         cp_fname = 'cp_{}'.format(''.join([random.choice('0123456789ABCDEF') for _ in range(16)]))
 
-        if train_frames.ndim > 3:
-            inputs = [train_frames[:, :self.lookback, :, i] for i in range(train_frames.shape[-1])] + \
-                     [train_frames[:, self.lookback:self.lookback + self.horizon, :, i]
-                      for i in range(train_frames.shape[-1])]
-            outputs = [train_frames[:, self.lookback + 1:self.lookback + self.horizon + 1, :, i]
-                       for i in range(train_frames.shape[-1])]
-        else:
-            inputs = [train_frames[:, :self.lookback], train_frames[:, self.lookback:self.lookback + self.horizon]]
-            outputs = [train_frames[:, self.lookback + 1:self.lookback + self.horizon + 1]]
+
 
         callbacks = [EarlyStopping(monitor='val_loss', min_delta=1e-3, patience=2, verbose=1, mode='min'),
                      ModelCheckpoint(cp_fname, monitor='val_loss', mode='min',
                                      save_best_only=True,
                                      save_weights_only=True)]
 
-        self.__sequence2sequence.fit(inputs, outputs, verbose=2, callbacks=callbacks, **kwargs)
+        self.__sequence2sequence.fit_generator(train_gen,
+                                               steps_per_epoch=tr_steps,
+                                               verbose=2,
+                                               validation_data=val_gen,
+                                               validation_steps=val_steps,
+                                               callbacks=callbacks,
+                                               epochs=epochs)
+
         self.__sequence2sequence.load_weights(cp_fname)
         os.remove(cp_fname)
 
@@ -327,17 +348,13 @@ class ContinuousSeq2Seq(ModelStrategy):
         self.predict_stochastic_decoder = K.function(decoder_predict_inputs, decoder_predict_outputs)
 
     def fit(self, train_frames, **kwargs):
-        # type: (np.ndarray) -> None
         cp_fname = 'cp_{}'.format(''.join([random.choice('0123456789ABCDEF') for _ in range(16)]))
-
-        inputs = [train_frames[:, :self.lookback], train_frames[:, self.lookback:self.lookback + self.horizon]]
-        outputs = [train_frames[:, self.lookback + 1:self.lookback + self.horizon + 1]]
-
         callbacks = [EarlyStopping(monitor='val_loss', min_delta=1e-3, patience=2, verbose=1, mode='min'),
                      ModelCheckpoint(cp_fname, monitor='val_loss', mode='min',
                                      save_best_only=True,
                                      save_weights_only=True)]
-
+        inputs = [train_frames[:, :self.lookback], train_frames[:, self.lookback:self.lookback + self.horizon]]
+        outputs = [train_frames[:, self.lookback + 1:self.lookback + self.horizon + 1]]
         self.__sequence2sequence.fit(inputs, outputs, verbose=2, callbacks=callbacks, **kwargs)
         self.__sequence2sequence.load_weights(cp_fname)
         os.remove(cp_fname)
@@ -444,9 +461,9 @@ class GPStrategy(ModelStrategy):
             pickle.dump(self, f)
 
     def fit(self, train_frames, restarts=1):
-        MAX_LENGTH = 10000
-        self.model = gpy.models.GPRegression(train_frames[:MAX_LENGTH, :self.lookback, 0],  # TODO: attractor compatibility
-                                             train_frames[:MAX_LENGTH, self.lookback:self.lookback+1, 0],
+        print "xxxx"
+        self.model = gpy.models.GPRegression(train_frames[:, :self.lookback, 0],  # TODO: attractor compatibility
+                                             train_frames[:, self.lookback:self.lookback+1, 0],
                                              self.ker)
 
         if restarts > 1:

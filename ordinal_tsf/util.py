@@ -38,3 +38,36 @@ def frame_ts(ts, frame_length, hop=1):
 
     s_idx = np.arange(0, ts_length - frame_length, hop)
     return np.array([ts[s:s + frame_length] for s in s_idx])
+
+
+def frame_generator(ts, frame_length, get_inputs, get_outputs, val_p, batch_size=256):
+    ts_length = ts.shape[0]
+    assert frame_length < ts_length, 'Choose timesteps < {}'.format(ts_length)
+
+    this_perm = np.random.permutation(ts_length - frame_length)
+    val_index = int(val_p * this_perm.shape[0])
+    tr_s_idx = this_perm[:val_index]
+    val_s_idx = this_perm[val_index:]
+    tr_steps = tr_s_idx.size // batch_size
+    val_steps = val_s_idx.size // batch_size
+
+    def fr_gen(ts, s_idx, frame_length, get_inputs, get_outputs, batch_size):
+        n_batches = s_idx.size // batch_size
+        while True:
+            np.random.shuffle(s_idx)
+
+            for i in range(1, n_batches + 1):
+                frames = np.array([ts[s:s + frame_length] for s in s_idx[(i - 1) * batch_size:i * batch_size]])
+                yield get_inputs(frames), get_outputs(frames)
+
+    return fr_gen(ts, tr_s_idx, frame_length, get_inputs, get_outputs, batch_size), \
+           fr_gen(ts, val_s_idx, frame_length, get_inputs, get_outputs, batch_size),\
+           tr_steps, val_steps
+
+
+
+
+
+
+
+

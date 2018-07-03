@@ -40,7 +40,7 @@ class Session:
             os.makedirs(self.directory + StrategyClass.id + '/plots/')
 
         dataset.save(self.directory + 'datasets/' + dataset.get_default_fname(self.directory[:-1]))
-        dataset = Dataset.load(self.directory + 'datasets/' + dataset.get_default_fname(self.directory[:-1]))
+        #dataset = Dataset.load(self.directory + 'datasets/' + dataset.get_default_fname(self.directory[:-1]))
         return StrategyExperiment(dataset, self.directory + StrategyClass.id + '/', StrategyClass)
 
 

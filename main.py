@@ -5,13 +5,13 @@ from ordinal_tsf.model import MordredStrategy
 from ordinal_tsf.dataset import Dataset, Quantiser, Standardiser, WhiteCorrupter, AttractorStacker, Selector, TestDefinition
 from ordinal_tsf.session import Session
 from ordinal_tsf.util import cartesian
-os.environ["CUDA_VISIBLE_DEVICES"]="4"
+os.environ["CUDA_VISIBLE_DEVICES"]="3"
 
 import tensorflow as tf
 from keras.backend.tensorflow_backend import set_session
 config = tf.ConfigProto()
 #config.gpu_options.allow_growth = True
-config.gpu_options.per_process_gpu_memory_fraction = 0.6
+config.gpu_options.per_process_gpu_memory_fraction = 0.45
 #config.gpu_options.visible_device_list = "4"
 set_session(tf.Session(config=config))
 
@@ -112,6 +112,6 @@ for FNAME in ALL_DS:
 
 print best_models
 
-with open('best_models', 'wb') as f:
+with open('best_models_mordred', 'wb') as f:
     pickle.dump(best_models, f)
 exit()

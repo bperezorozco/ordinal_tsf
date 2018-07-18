@@ -40,6 +40,75 @@ def frame_ts(ts, frame_length, hop=1):
     return np.array([ts[s:s + frame_length] for s in s_idx])
 
 
+def frame_generator_list(ts_list, frame_length, get_inputs, get_outputs, val_p, batch_size=256):
+    train_list = []
+    train_perm_list = []
+    val_list = []
+    val_perm_list = []
+
+    total_tr_steps = 0
+    total_val_steps = 0
+
+    def single_fr_gen(ts, perm, frame_length):
+        while True:
+            np.random.shuffle(perm)
+            for s in perm:
+                yield ts[s:s+frame_length]
+
+    for ts in ts_list:
+        ts_length = ts.shape[0]
+        ts_effective_length = ts_length - frame_length
+        val_n = ts_effective_length - int(val_p * ts_effective_length)
+
+        if int(val_p * ts_effective_length) < frame_length:
+            continue
+
+        train_list += [ts[:val_n]]
+        val_list += [ts[val_n:]]
+
+        train_perm_list += [np.random.permutation(ts[:val_n].shape[0] - frame_length)]
+        val_perm_list +=  [np.random.permutation(ts[val_n:].shape[0] - frame_length)]
+
+        total_tr_steps += train_perm_list[-1].size // batch_size
+        total_val_steps += val_perm_list[-1].size // batch_size
+
+    def fr_gen(ts_list, perm_list, frame_length, get_inputs, get_outputs, batch_size):
+        while True:
+            n_remaining = len(ts_list)
+            # build individual generators
+            ts_gens = [single_fr_gen(ts, perm, frame_length) for ts, perm in zip(ts_list, perm_list)]
+
+            while n_remaining > 0:
+                current_frames = []
+                current_batch_size = 0
+                insufficient_frames_left = False
+
+                while current_batch_size < batch_size:
+                    i_ts = np.random.choice(n_remaining)
+                    frame = next(ts_gens[i_ts], None)
+
+                    if frame is None:
+                        ts_gens.pop(i_ts)
+                        n_remaining -= 1
+
+                        if n_remaining == 0:
+                            insufficient_frames_left = True
+                            break
+
+                    else:
+                        current_frames += [frame]
+                        current_batch_size += 1
+
+                if insufficient_frames_left: continue
+
+                current_frames = np.stack(current_frames, axis=0)
+                yield get_inputs(current_frames), get_outputs(current_frames)
+
+    return fr_gen(train_list, train_perm_list, frame_length, get_inputs, get_outputs, batch_size), \
+        fr_gen(val_list, val_perm_list, frame_length, get_inputs, get_outputs, batch_size), \
+        total_tr_steps, total_val_steps
+
+
 def frame_generator(ts, frame_length, get_inputs, get_outputs, val_p, batch_size=256):
     ts_length = ts.shape[0]
     assert frame_length < ts_length, 'Choose timesteps < {}'.format(ts_length)

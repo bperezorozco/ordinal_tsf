@@ -57,6 +57,9 @@ class StrategyExperiment:
     def build_prediction(self, prediction):
         """Adapts the raw prediction of a strategy into the correct format as given by the dataset's representation"""
         # type: (dict) -> Prediction
+        if self.dataset.optional_params.get('is_sarimax', False):
+            return GaussianPrediction(None, prediction)
+
         if self.dataset.optional_params.get('is_attractor', False):
             for k, v in prediction.items():
                 prediction[k] = v.take(-1, axis=-1)
@@ -119,7 +122,6 @@ class StrategyExperiment:
                     "Prediction index {} must be greater than model strategy seed length".format(prediction_index,
                                                                                                  model.seed_length)
                 model_input = eval_ts[np.newaxis, seed_start:prediction_index]
-
                 prediction = model.predict(model_input,
                                            predictive_horizon=predictive_horizon,
                                            **eval_kwargs)

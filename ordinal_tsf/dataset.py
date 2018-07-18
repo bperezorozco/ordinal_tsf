@@ -1,12 +1,15 @@
 from abc import ABCMeta, abstractmethod
 from sklearn.metrics import mean_squared_error
 from matplotlib.colors import ListedColormap
-from util import assert_sum_one, all_satisfy, frame_ts, is_univariate, frame_generator
+from util import assert_sum_one, all_satisfy, frame_ts, is_univariate, frame_generator, frame_generator_list
 import pickle
 import numpy as np
 import seaborn as sns
 from scipy.stats import norm
 from functools import partial
+from sklearn.mixture import BayesianGaussianMixture
+import copy
+
 
 class Dataset(object):
     """Handler for a time series dataset and its different representations."""
@@ -38,8 +41,8 @@ class Dataset(object):
 
         if self.optional_params.get('frame_generator', False):
             self.train_frames = partial(frame_generator, ts=self.train_ts, frame_length=frame_length)
-            self.val_frames = partial(frame_generator, ts=self.train_ts, frame_length=frame_length)
-            self.test_frames = partial(frame_generator, ts=self.train_ts, frame_length=frame_length)
+            self.val_frames = partial(frame_generator, ts=self.val_ts, frame_length=frame_length)
+            self.test_frames = partial(frame_generator, ts=self.test_ts, frame_length=frame_length)
         else:
             self.train_frames = frame_ts(self.train_ts, frame_length)
             self.val_frames = frame_ts(self.val_ts, frame_length)
@@ -118,6 +121,55 @@ class Dataset(object):
         return ts
 
 
+class TimeSeriesSetDataset(object):
+    """This handler takes a list of time series and treats each of them as an individual subdataset"""
+    def __init__(self, ts_list, frame_length, p_train=0.7, p_val=0.15, p_test=0.15, preprocessing_steps=[]):
+        # type: (List[np.ndarray], int, float, float, float, List[DatasetPreprocessingStep]) -> TimeSeriesSetDataset
+
+        assert [raw_ts.ndim == 2 and raw_ts.shape[0] > frame_length for raw_ts in ts_list], \
+            'Please provide only univariate time series as input to Dataset.'
+
+        self.raw_ts_list = []
+        self.frame_length = frame_length
+        self.train_ts = []
+        self.val_ts = []
+        self.test_ts = []
+        self.optional_params_list = []
+        self.preprocessing_steps_list = []
+        self.frame_length = frame_length
+
+        for ts in ts_list:
+            self.raw_ts_list += [ts.copy()]
+            n_train = int(p_train * ts.shape[0])
+            n_train_val = int((p_train + p_val) * ts.shape[0])
+
+            cur_train_ts = ts[:n_train]
+            cur_val_ts = ts[n_train:n_train_val]
+            cur_test_ts = ts[n_train_val:]
+            current_optional_params = {}
+            current_preproc_steps = []
+
+            for step in preprocessing_steps:
+                this_step = copy.deepcopy(step)
+
+                cur_train_ts = this_step.apply(cur_train_ts)
+                cur_val_ts = this_step.apply(cur_val_ts)
+                cur_test_ts = this_step.apply(cur_test_ts)
+
+                current_preproc_steps += [this_step]
+                current_optional_params.update(this_step.param_dict)
+
+            self.optional_params_list += [current_optional_params]
+            self.train_ts += [cur_train_ts]
+            self.val_ts += [cur_val_ts]
+            self.test_ts += [cur_test_ts]
+            self.preprocessing_steps_list += [current_preproc_steps]
+
+        self.train_frames = partial(frame_generator_list, ts_list=self.train_ts, frame_length=frame_length)
+        self.val_frames = partial(frame_generator_list, ts_list=self.val_ts, frame_length=frame_length)
+        self.test_frames = partial(frame_generator_list, ts_list=self.test_ts, frame_length=frame_length)
+
+
 class DatasetPreprocessingStep(object):
     """Provides a common interface for the individual transformations of the dataset preprocessing pipeline
 
@@ -148,6 +200,19 @@ class WhiteCorrupter(DatasetPreprocessingStep):
     def apply(self, ts):
         self.param_dict['white_noise_level'] = self.noise_level
         return ts + np.random.normal(scale=self.noise_level, size=ts.shape)
+
+
+class FrameGenerator(DatasetPreprocessingStep):
+    """Ensures the time series framer will be a generator
+
+    Args:
+        sigma (float): noise standard deviation
+    """
+    def __init__(self):
+        self.param_dict['frame_generator'] = True
+
+    def apply(self, ts):
+        return ts
 
 
 class Standardiser(DatasetPreprocessingStep):
@@ -290,6 +355,12 @@ class OrdinalPrediction(Prediction):
         # type: (np.ndarray) -> np.float
         return np.mean([mean_squared_error(ground_truth, p) for p in self.draws])
 
+    def mse_mean(self, ground_truth):
+        return mean_squared_error(ground_truth, self.ordinal_pdf.dot(self.bins).squeeze())
+
+    def quantile_mse(self, ground_truth, alpha=0.5):
+        return mean_squared_error(ground_truth, self.get_quantile(alpha).squeeze())
+
     def mse_and_std(self, ground_truth):
         """Computes MSE +- STD between two real-valued time series"""
         # type: (np.ndarray) -> np.float
@@ -312,7 +383,7 @@ class OrdinalPrediction(Prediction):
 
     def get_quantile(self, alpha):
         """Computes \alpha-quantiles given the object's ordinal pdf"""
-        # type: (np.ndarray) -> np.float
+        # type: (float) -> np.ndarray
         cdf = self.ordinal_pdf.cumsum(axis=-1)
         return np.array([self.bins[j] for j in (cdf >= alpha).argmax(axis=-1)])
 
@@ -328,10 +399,16 @@ class OrdinalPrediction(Prediction):
         plt.plot(ground_truth, 'xkcd:olive')
         plt.legend(['Quantile 0.025', 'Quantile 0.975', 'Median', 'True'])
 
-    def plot_like(self, plt):
+    def plot_like(self, plt, ground_truth=None):
         """Plots the full ordinal pdf as a heatmap"""
-        plt.imshow(self.ordinal_pdf.T, cmap=ListedColormap(sns.color_palette("RdBu_r", 500).as_hex()),
-                   origin='lower', aspect='auto')
+        if ground_truth is not None:
+            plt.plot(ground_truth, 'xkcd:orange')
+
+        plt.imshow(self.ordinal_pdf.T, origin='lower',
+                   extent=[0, self.ordinal_pdf.shape[0], self.bins.min(), self.bins.max()],
+                   aspect='auto', cmap='Blues')
+        plt.title('Predictive likelihood')
+        plt.colorbar()
 
     def plot_cum_nll(self, plt, binned_ground_truth):
         """Plots the full ordinal pdf as a heatmap"""
@@ -342,11 +419,61 @@ class OrdinalPrediction(Prediction):
         plt.plot(cum_nll)
         plt.title('Cumulative negative log likelihood')
 
-    def plot_log_like(self, plt):
+    def plot_log_like(self, plt, ground_truth=None):
         """Plots the full log ordinal pdf as a heatmap"""
-        log_like = np.ma.log(self.ordinal_pdf.T)
-        plt.imshow(log_like, cmap=ListedColormap(sns.color_palette("RdBu_r", 500).as_hex()),
-                   origin='lower', aspect='auto')
+        if ground_truth is not None:
+            plt.plot(ground_truth, 'xkcd:orange')
+
+        plt.imshow(np.ma.log(self.ordinal_pdf.T).data, origin='lower',
+                   extent=[0, self.ordinal_pdf.shape[0], self.bins.min(), self.bins.max()],
+                   aspect='auto', cmap='Blues')
+        plt.title('Predictive log likelihood')
+        plt.colorbar()
+
+    def plot_draws_quantiles(self, plt, ground_truth):
+        """Plots a probabilistic forecast's median and 2.5, 97.5 quantiles alongside the corresponding ground truth"""
+        quantile_025 = self.get_quantile(0.025)
+        quantile_975 = self.get_quantile(0.975)
+        quantile_median = self.get_quantile(0.5)
+
+        [plt.plot(x, color='xkcd:blue', alpha=0.1) for x in self.draws.squeeze()]
+        plt.plot(quantile_025, 'xkcd:orange')
+        plt.plot(quantile_975, 'xkcd:orange')
+        plt.plot(quantile_median, 'xkcd:maroon')
+        plt.plot(ground_truth, 'xkcd:olive')
+        plt.legend(['Quantile 0.025', 'Quantile 0.975', 'Median', 'True'])
+
+    def plot_empirical(self, plt, ground_truth):
+        c_pal = sns.color_palette('Blues', n_colors=150).as_hex()
+        my_cmap = ListedColormap(c_pal + c_pal[::-1][1:])
+        quantile_025 = self.get_quantile(0.025)
+        quantile_975 = self.get_quantile(0.975)
+
+        plt.plot(quantile_025, 'xkcd:azure')
+        plt.plot(quantile_975, 'xkcd:azure')
+        plt.plot(ground_truth, 'xkcd:coral')
+        plt.imshow(self.ordinal_pdf.cumsum(axis=-1).T, origin='lower',
+                   extent=[0, 1000, self.bins.min(), self.bins.max()],
+                   aspect='auto', cmap=my_cmap)
+        #plt.title('Empirical distribution function')
+        #plt.colorbar()
+
+    def plot_qq(self, plt, ordinal_ground_truth, col='xkcd:blue'):
+        qq_x = np.arange(0.01, 1., 0.01)
+        y_pred_idx = (self.ordinal_pdf * ordinal_ground_truth).argmax(axis=-1)
+        cdf_truth = np.array([self.ordinal_pdf[t, :idx].sum() for t, idx in enumerate(y_pred_idx)])
+        qq_ordinal = np.array([(cdf_truth <= alpha).mean() for alpha in qq_x])
+        plt.plot(qq_x, qq_ordinal, col)
+        plt.plot(qq_x, qq_x, '--', color='xkcd:green')
+        plt.legend(['Ordinal prediction', 'Ideal'])
+        #plt.title('Uncertainty calibration plot for ordinal prediction')
+
+
+    @staticmethod
+    def compatibility(old_pred):
+        new_pred = OrdinalPrediction(old_pred.ordinal_pdf, [], old_pred.bins)
+        new_pred.draws = old_pred.draws
+        return new_pred
 
 
 class GaussianPrediction(Prediction):
@@ -365,15 +492,28 @@ class GaussianPrediction(Prediction):
 
     type = 'gaussian'
 
-    def __init__(self, draws):
-        self.posterior_mean = draws.mean(axis=0)
-        self.posterior_std = draws.std(axis=0)
-        self.draws = draws
+    def __init__(self, draws, raw_pred=None):
+        if raw_pred is None:
+            self.posterior_mean = draws.mean(axis=0)
+            self.posterior_std = draws.std(axis=0)
+            self.draws = draws
+        else:
+            self.posterior_mean = raw_pred['posterior_mean'].squeeze()
+            self.posterior_std = raw_pred['posterior_std'].squeeze()
+            self.draws = np.stack([np.random.normal(self.posterior_mean[t],
+                                                    self.posterior_std[t],
+                                                    size = 100) for t in range(self.posterior_mean.shape[0])], axis=1)
 
     def mse(self, ground_truth):
         """Computes MSE between two real-valued time series"""
         # type: (np.ndarray) -> np.float
         return np.mean([mean_squared_error(ground_truth, p) for p in self.draws])
+
+    def mse_mean(self, ground_truth):
+        return mean_squared_error(ground_truth, self.posterior_mean)
+
+    def quantile_mse(self, ground_truth, alpha=0.5):
+        return mean_squared_error(ground_truth, self.get_quantile(alpha).squeeze())
 
     def nll(self, ground_truth):
         """Computes NLL of drawing a time series from a GP sequential prediction"""
@@ -382,9 +522,20 @@ class GaussianPrediction(Prediction):
         likelihood = np.array([norm(loc=self.posterior_mean[i], scale=self.posterior_std[i]).pdf(ground_truth[i])
                                for i in range(horizon)])
 
-        nll = -np.log(likelihood).sum()
-        print 'NLL: {}'.format(nll)
+        log_like = -np.log(likelihood)
+        if np.isinf(log_like).any():
+            likelihood += 1e-12
+            likelihood /= likelihood.sum()
+            log_like = -np.log(likelihood)
+
+        nll = log_like.sum()
+        #print 'NLL: {}'.format(nll)
         return nll
+
+    def get_quantile(self, alpha):
+        """Computes \alpha-quantiles given the object's posterior mean and standard deviation"""
+        # type: (float) -> np.ndarray
+        return np.array([norm.ppf(alpha, mu, sigma) for mu, sigma in zip(self.posterior_mean, self.posterior_std)])
 
     def cum_nll(self, ground_truth):
         """Computes compulative NLL of drawing a time series from a GP sequential prediction"""
@@ -394,7 +545,7 @@ class GaussianPrediction(Prediction):
                                for i in range(horizon)])
 
         nll = -np.log(likelihood).cumsum().sum()
-        print 'Cum NLL: {}'.format(nll)
+        #print 'Cum NLL: {}'.format(nll)
         return nll
 
     def plot_cum_nll(self, plt, ground_truth):
@@ -420,10 +571,239 @@ class GaussianPrediction(Prediction):
         plt.plot(ground_truth, 'xkcd:olive')
         plt.legend(['Quantile 0.025', 'Quantile 0.975', 'Median', 'True'])
 
+    def plot_draws_quantiles(self, plt, ground_truth):
+        """Plots a probabilistic forecast's median and 2.5, 97.5 quantiles alongside the corresponding ground truth"""
+        quantile_median = self.posterior_mean
+        quantile_025 = quantile_median - 2 * self.posterior_std
+        quantile_975 = quantile_median + 2 * self.posterior_std
+
+        [plt.plot(x, color='xkcd:blue', alpha=0.1) for x in self.draws.squeeze()]
+        plt.plot(quantile_025, 'xkcd:orange')
+        plt.plot(quantile_975, 'xkcd:orange')
+        plt.plot(quantile_median, 'xkcd:maroon')
+        plt.plot(ground_truth, 'xkcd:olive')
+        plt.legend(['Quantile 0.025', 'Quantile 0.975', 'Median', 'True'])
+
+    def plot_empirical(self, plt, ground_truth):
+        x_min = ground_truth.min()
+        x_max = ground_truth.max()
+        x = np.linspace(x_min, x_max, 300)
+
+        cdf = np.stack([norm.cdf(x, mu, sigma) for mu, sigma in zip(self.posterior_mean, self.posterior_std)], axis=0)
+
+        quantile_025 = self.get_quantile(0.025)
+        quantile_975 = self.get_quantile(0.975)
+
+        plt.plot(quantile_025, 'xkcd:azure')
+        plt.plot(quantile_975, 'xkcd:azure')
+
+        c_pal = sns.color_palette('Blues', n_colors=150).as_hex()
+        my_cmap = ListedColormap(c_pal + c_pal[::-1][1:])
+
+        plt.plot(ground_truth, 'xkcd:coral')
+        plt.imshow(cdf.T, origin='lower',
+                   extent=[0, cdf.shape[0], x_min, x_max],
+                   aspect='auto', cmap=my_cmap)
+        #plt.title('Empirical distribution function')
+        #plt.colorbar()
+
+    def plot_qq(self, plt, ground_truth, col='xkcd:blue'):
+        qq_x = np.arange(0.01, 1., 0.01)
+        qq_gp = [np.less_equal(ground_truth.squeeze(), self.get_quantile(a)).mean() for a in qq_x]
+        plt.plot(qq_x, qq_gp, color=col)
+        plt.plot(qq_x, qq_x, '--', color='xkcd:green')
+        plt.legend(['Continuous prediction', 'Ideal'])
+        #plt.title('Uncertainty calibration plot for continuous prediction')
+
+    @staticmethod
+    def compatibility(old_pred):
+        return GaussianPrediction(old_pred.draws)
+
+
+class GaussianMixturePrediction(Prediction):
+    type = 'gmm'
+
+    def __init__(self, draws, n_components, vbgmms=None):
+        draw_length = draws.shape[1]
+        self.n_components = n_components
+        self.draws = draws
+        overall_x_min = None
+        overall_x_max = None
+
+        if vbgmms is None:
+            self.vbgmms = []
+            for t in range(draw_length):
+                self.vbgmms += [BayesianGaussianMixture(self.n_components, n_init=3, max_iter=200).fit(self.draws[:, t, np.newaxis])]
+        else:
+            self.vbgmms = vbgmms
+
+        for vbgmm in self.vbgmms:
+            x_min = (vbgmm.means_.squeeze() - 3. * np.sqrt(vbgmm.covariances_).squeeze()).min()
+            x_max = (vbgmm.means_.squeeze() + 3. * np.sqrt(vbgmm.covariances_).squeeze()).max()
+
+            if overall_x_min is None or x_min < overall_x_min:
+                overall_x_min = x_min
+
+            if overall_x_max is None or x_max > overall_x_max:
+                overall_x_max = x_max
+
+        x = np.linspace(overall_x_min, overall_x_max, 300)
+        self.ts_range = x
+        self.cdf = self.eval_cdf(x)
+
+    def mse(self, ground_truth):
+        """Computes MSE between two real-valued time series"""
+        # type: (np.ndarray) -> np.float
+        return np.mean([mean_squared_error(ground_truth, p) for p in self.draws])
+
+    def mse_mean(self, ground_truth):
+        return mean_squared_error(ground_truth, self.draws.mean(axis=0))
+
+    def quantile_mse(self, ground_truth, alpha=0.5):
+        return mean_squared_error(ground_truth, self.get_quantile(alpha).squeeze())
+
+    def nll(self, ground_truth):
+        """Computes NLL of drawing a time series from a GP sequential prediction"""
+        # type: (np.ndarray) -> np.float
+        horizon = len(self.vbgmms)
+        likelihood = []
+
+        for t in range(horizon):
+            vbgmm = self.vbgmms[t]
+            p = 0.
+            for pi, mu, sigma_sq in zip(vbgmm.weights_.squeeze(), vbgmm.means_.squeeze(), vbgmm.covariances_.squeeze()):
+                sigma = np.sqrt(sigma_sq)
+                p += pi * norm.pdf(ground_truth[t], mu, sigma)
+
+            likelihood += [p]
+
+        likelihood = np.array(likelihood)
+        nll = -np.log(likelihood).sum()
+        #print 'NLL: {}'.format(nll)
+        return nll
+
+    def get_quantile(self, alpha):
+        """Computes \alpha-quantiles given the object's posterior mean and standard deviation"""
+        # type: (float) -> np.ndarray
+
+        return np.array([self.ts_range[j] for j in (self.cdf >= alpha).argmax(axis=-1)])
+
+    def cum_nll(self, ground_truth):
+        """Computes compulative NLL of drawing a time series from a GP sequential prediction"""
+        # type: (np.ndarray) -> np.float
+        horizon = len(self.vbgmms)
+        likelihood = []
+
+        for t in range(horizon):
+            vbgmm = self.vbgmms[t]
+            p = 0.
+            for pi, mu, sigma_sq in zip(vbgmm.weights_.squeeze(), vbgmm.means_.squeeze(), vbgmm.covariances_.squeeze()):
+                sigma = np.sqrt(sigma_sq)
+                p += pi * norm.pdf(ground_truth[t], mu, sigma)
+
+            likelihood += [p]
+
+        likelihood = np.array(likelihood)
+
+        nll = -np.log(likelihood).cumsum().sum()
+        #print 'Cum NLL: {}'.format(nll)
+        return nll
+
+    def plot_cum_nll(self, plt, ground_truth):
+        """Computes compulative NLL of drawing a time series from a GP sequential prediction"""
+        # type: (np.ndarray) -> np.float
+        horizon = len(self.vbgmms)
+        likelihood = []
+
+        for t in range(horizon):
+            vbgmm = self.vbgmms[t]
+            p = 0.
+            for pi, mu, sigma_sq in zip(vbgmm.weights_.squeeze(), vbgmm.means_.squeeze(), vbgmm.covariances_.squeeze()):
+                sigma = np.sqrt(sigma_sq)
+                p += pi * norm.pdf(ground_truth[t], mu, sigma)
+
+            likelihood += [p]
+
+        likelihood = np.array(likelihood)
+
+        nll = -np.log(likelihood).cumsum()
+        plt.plot(nll)
+        plt.title('Cumulative negative log likelihood')
+
+    def plot_median_2std(self, plt, ground_truth):
+        """Plots a probabilistic forecast's median and 2.5, 97.5 quantiles alongside the corresponding ground truth"""
+        quantile_025 = self.get_quantile(0.025)
+        quantile_975 = self.get_quantile(0.975)
+        quantile_median = self.get_quantile(0.5)
+
+        plt.plot(quantile_025, 'xkcd:orange')
+        plt.plot(quantile_975, 'xkcd:orange')
+        plt.plot(quantile_median, 'xkcd:maroon')
+        plt.plot(ground_truth, 'xkcd:olive')
+        plt.legend(['Quantile 0.025', 'Quantile 0.975', 'Median', 'True'])
+
+    def eval_cdf(self, x):
+        cdf = []
+
+        for vbgmm in self.vbgmms:
+            P = 0.
+            for pi, mu, sigma_sq in zip(vbgmm.weights_.squeeze(), vbgmm.means_.squeeze(), vbgmm.covariances_.squeeze()):
+                sigma = np.sqrt(sigma_sq)
+                P += pi * norm.cdf(x, mu, sigma)
+
+            cdf += [P]
+
+        return np.stack(cdf, axis=0)
+
+    def plot_draws_quantiles(self, plt, ground_truth):
+        """Plots a probabilistic forecast's median and 2.5, 97.5 quantiles alongside the corresponding ground truth"""
+        quantile_025 = self.get_quantile(0.025)
+        quantile_975 = self.get_quantile(0.975)
+        quantile_median = self.get_quantile(0.5)
+
+        [plt.plot(x, color='xkcd:blue', alpha=0.1) for x in self.draws.squeeze()]
+        plt.plot(quantile_025, 'xkcd:orange')
+        plt.plot(quantile_975, 'xkcd:orange')
+        plt.plot(quantile_median, 'xkcd:maroon')
+        plt.plot(ground_truth, 'xkcd:olive')
+        plt.legend(['Quantile 0.025', 'Quantile 0.975', 'Median', 'True'])
+
+    def plot_empirical(self, plt, ground_truth):
+        c_pal = sns.color_palette('Blues', n_colors=150).as_hex()
+        my_cmap = ListedColormap(c_pal + c_pal[::-1][1:])
+
+        quantile_025 = self.get_quantile(0.025)
+        quantile_975 = self.get_quantile(0.975)
+
+        plt.plot(quantile_025, 'xkcd:azure')
+        plt.plot(quantile_975, 'xkcd:azure')
+
+        plt.plot(ground_truth, 'xkcd:coral')
+        plt.imshow(self.cdf.T, origin='lower',
+                   extent=[0, self.cdf.shape[0], self.ts_range.min(), self.ts_range.max()],
+                   aspect='auto', cmap=my_cmap)
+        #plt.title('Empirical distribution function')
+        #plt.colorbar()
+
+    def plot_qq(self, plt, ground_truth, col='xkcd:blue'):
+        qq_x = np.arange(0.01, 1., 0.01)
+        qq_gp = [np.less_equal(ground_truth.squeeze(), self.get_quantile(a)).mean() for a in qq_x]
+        plt.plot(qq_x, qq_gp, color=col)
+        plt.plot(qq_x, qq_x, '--', color='xkcd:green')
+        plt.legend(['Continuous prediction', 'Ideal'])
+        #plt.title('Uncertainty calibration plot for continuous prediction')
+
+    @staticmethod
+    def compatibility_univar_gaussian(old_pred, n_components):
+        return GaussianMixturePrediction(old_pred.draws, n_components)
+
+    @staticmethod
+    def compatibility(old_pred):
+        return GaussianMixturePrediction(old_pred.draws, old_pred.n_components, old_pred.vbgmms)
+
 
 class TestDefinition(object):
     """Defines a ground truth and a metric to evaluate predictions on.
-
     Sequences of tests can be provided and reused across different model strategies, which guarantees result consistency.
 
     Args:

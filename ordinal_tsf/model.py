@@ -3,13 +3,14 @@ from keras import Model, Sequential, Input
 from keras.layers import Dense, LSTM, Average, Bidirectional, Dropout, Concatenate
 from keras.regularizers import l2
 from keras.callbacks import ModelCheckpoint, EarlyStopping
+import statsmodels.api as sm
 import keras.backend as K
 import pickle
 import numpy as np
 import GPy as gpy
 import random
 import os
-from functools import partial
+
 
 
 class ModelStrategy(object):
@@ -18,7 +19,7 @@ class ModelStrategy(object):
     filename = 'tmp_'
 
     @abstractmethod
-    def fit(self, dataset, **kwargs): pass
+    def fit(self, train_frames, **kwargs): pass
 
     @abstractmethod
     def predict(self, inputs, horizon=100, **kwargs): pass
@@ -159,8 +160,6 @@ class MordredStrategy(ModelStrategy):
 
         cp_fname = 'cp_{}'.format(''.join([random.choice('0123456789ABCDEF') for _ in range(16)]))
 
-
-
         callbacks = [EarlyStopping(monitor='val_loss', min_delta=1e-3, patience=2, verbose=1, mode='min'),
                      ModelCheckpoint(cp_fname, monitor='val_loss', mode='min',
                                      save_best_only=True,
@@ -273,6 +272,46 @@ class MordredStrategy(ModelStrategy):
     @property
     def seed_length(self):
         return self.lookback + 1
+
+
+class SARIMAXStrategy(ModelStrategy):
+    filename = ''
+    id = 'sarimax'
+
+    def __init__(self, order, seasonal_order=(0,0,0,0)):
+        self.order = order
+        self.seasonal_order = seasonal_order
+
+    def fit(self, train_frames, **kwargs):
+        self.model = sm.tsa.statespace.SARIMAX(train_frames, order=self.order, seasonal_order=self.seasonal_order)
+        self.fit_res = self.model.fit(disp=False)
+
+    def predict(self, inputs, predictive_horizon=100, **kwargs):
+        pred = self.fit_res.get_forecast(steps=predictive_horizon)
+        return {'posterior_mean':pred.predicted_mean, 'posterior_std':np.sqrt(pred.var_pred_mean)}
+
+    @staticmethod
+    def load(fname, **kwargs):
+        this = None
+        with open(fname, 'r') as f:
+            this = pickle.load(f)
+
+        return this
+
+    def save(self, folder):
+        params = {'order':self.order, 'seasonal_order':self.seasonal_order}
+
+        with open(folder + SARIMAXStrategy.get_filename(params), 'wb') as f:
+            pickle.dump(self, f)
+
+    @staticmethod
+    def get_filename(params):
+        # type: (dict) -> str
+        return 'sarimax_{}_{}'.format(params['order'][0], params['seasonal_order'][0])
+
+    @property
+    def seed_length(self):
+        return 121
 
 
 class ContinuousSeq2Seq(ModelStrategy):
@@ -439,6 +478,7 @@ class ContinuousSeq2Seq(ModelStrategy):
 class GPStrategy(ModelStrategy):
     """Implements the autoregressive Gaussian Process time series forecasting strategy."""
     id = 'argp'
+    n_max_train = 10000
 
     def __init__(self, ker, lookback=100, horizon=1, fname='tmp', n_channels=1):
         self.ker = ker + gpy.kern.White(lookback)
@@ -461,9 +501,11 @@ class GPStrategy(ModelStrategy):
             pickle.dump(self, f)
 
     def fit(self, train_frames, restarts=1):
-        print "xxxx"
-        self.model = gpy.models.GPRegression(train_frames[:, :self.lookback, 0],  # TODO: attractor compatibility
-                                             train_frames[:, self.lookback:self.lookback+1, 0],
+        if train_frames.shape[0] > self.n_max_train:
+            print "Time series is too long! Training on first {} samples".format(self.n_max_train)
+
+        self.model = gpy.models.GPRegression(train_frames[:self.n_max_train, :self.lookback, 0],  # TODO: attractor compatibility
+                                             train_frames[:self.n_max_train, self.lookback:self.lookback+1, 0],
                                              self.ker)
 
         if restarts > 1:

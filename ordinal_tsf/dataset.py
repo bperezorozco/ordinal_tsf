@@ -1,13 +1,16 @@
 from abc import ABCMeta, abstractmethod
 from sklearn.metrics import mean_squared_error
+from sklearn.metrics.pairwise import pairwise_distances
 from matplotlib.colors import ListedColormap
 from util import assert_sum_one, all_satisfy, frame_ts, is_univariate, frame_generator, frame_generator_list
 import pickle
 import numpy as np
 import seaborn as sns
 from scipy.stats import norm
+from scipy.spatial.distance import euclidean
 from functools import partial
 from sklearn.mixture import BayesianGaussianMixture
+from fastdtw import fastdtw
 import copy
 
 
@@ -367,12 +370,35 @@ class OrdinalPrediction(Prediction):
         all_mse = [mean_squared_error(ground_truth, prediction) for prediction in self.draws]
         return np.mean(all_mse), np.std(all_mse)
 
+    def median_dtw_distance(self, ground_truth):
+        pred_median = self.get_quantile(0.5)
+        dist, path = fastdtw(pred_median, ground_truth, dist=euclidean)
+
+        return dist
+
+    def median_attractor_distance(self, ground_truth):
+        pred_median = self.get_quantile(0.5)
+        stacker = AttractorStacker(10)
+        pred_median_att = stacker.apply(pred_median).squeeze()
+        ground_truth_att = stacker.apply(ground_truth).squeeze()
+
+        d = pairwise_distances(pred_median_att, ground_truth_att)
+        return d.min(axis=0).sum()
+
     def nll(self, binned_ground_truth):
         """Computes NLL of drawing a time series from a piecewise uniform sequential prediction"""
         # type: (np.ndarray) -> np.float
         p_ground_truth = (self.ordinal_pdf * binned_ground_truth / self.delta).max(axis=-1)
         neg_log_p_ground_truth = -np.log(p_ground_truth)
         return neg_log_p_ground_truth.sum()
+
+    def qq_dist(self, ordinal_ground_truth, up_to=1000):
+        qq_x = np.arange(0.01, 1., 0.01)
+        y_pred_idx = (self.ordinal_pdf[:up_to] * ordinal_ground_truth[:up_to]).argmax(axis=-1)
+        cdf_truth = np.array([self.ordinal_pdf[t, :idx].sum() for t, idx in enumerate(y_pred_idx)])
+        qq_ordinal = np.array([(cdf_truth <= alpha).mean() for alpha in qq_x])
+
+        return mean_squared_error(qq_x, qq_ordinal)
 
     def cum_nll(self, binned_ground_truth):
         """Computes integral of NLL(t) of drawing a time series from a piecewise uniform sequential prediction"""
@@ -458,9 +484,9 @@ class OrdinalPrediction(Prediction):
         #plt.title('Empirical distribution function')
         #plt.colorbar()
 
-    def plot_qq(self, plt, ordinal_ground_truth, col='xkcd:blue'):
+    def plot_qq(self, plt, ordinal_ground_truth, up_to=1000, col='xkcd:blue'):
         qq_x = np.arange(0.01, 1., 0.01)
-        y_pred_idx = (self.ordinal_pdf * ordinal_ground_truth).argmax(axis=-1)
+        y_pred_idx = (self.ordinal_pdf[:up_to] * ordinal_ground_truth[:up_to]).argmax(axis=-1)
         cdf_truth = np.array([self.ordinal_pdf[t, :idx].sum() for t, idx in enumerate(y_pred_idx)])
         qq_ordinal = np.array([(cdf_truth <= alpha).mean() for alpha in qq_x])
         plt.plot(qq_x, qq_ordinal, col)
@@ -468,6 +494,12 @@ class OrdinalPrediction(Prediction):
         plt.legend(['Ordinal prediction', 'Ideal'])
         #plt.title('Uncertainty calibration plot for ordinal prediction')
 
+    def plot_median_dtw_alignment(self, plt, ground_truth):
+        pred_median = self.get_quantile(0.5)
+        dist, path = fastdtw(pred_median, ground_truth, dist=euclidean)
+
+        plt.plot(np.array([pred_median[j] for i, j in path]))
+        plt.plot(np.array([ground_truth[i] for i, j in path]))
 
     @staticmethod
     def compatibility(old_pred):
@@ -515,6 +547,21 @@ class GaussianPrediction(Prediction):
     def quantile_mse(self, ground_truth, alpha=0.5):
         return mean_squared_error(ground_truth, self.get_quantile(alpha).squeeze())
 
+    def median_dtw_distance(self, ground_truth):
+        pred_median = self.get_quantile(0.5)
+        dist, path = fastdtw(pred_median, ground_truth, dist=euclidean)
+
+        return dist
+
+    def median_attractor_distance(self, ground_truth):
+        pred_median = self.get_quantile(0.5)
+        stacker = AttractorStacker(10)
+        pred_median_att = stacker.apply(pred_median).squeeze()
+        ground_truth_att = stacker.apply(ground_truth).squeeze()
+
+        d = pairwise_distances(pred_median_att, ground_truth_att)
+        return d.min(axis=0).sum()
+
     def nll(self, ground_truth):
         """Computes NLL of drawing a time series from a GP sequential prediction"""
         # type: (np.ndarray) -> np.float
@@ -531,6 +578,11 @@ class GaussianPrediction(Prediction):
         nll = log_like.sum()
         #print 'NLL: {}'.format(nll)
         return nll
+
+    def qq_dist(self, ground_truth, up_to=1000):
+        qq_x = np.arange(0.01, 1., 0.01)
+        qq_gp = [np.less_equal(ground_truth.squeeze()[:up_to], self.get_quantile(a)[:up_to]).mean() for a in qq_x]
+        return mean_squared_error(qq_x, qq_gp)
 
     def get_quantile(self, alpha):
         """Computes \alpha-quantiles given the object's posterior mean and standard deviation"""
@@ -607,9 +659,9 @@ class GaussianPrediction(Prediction):
         #plt.title('Empirical distribution function')
         #plt.colorbar()
 
-    def plot_qq(self, plt, ground_truth, col='xkcd:blue'):
+    def plot_qq(self, plt, ground_truth, up_to=1000, col='xkcd:blue'):
         qq_x = np.arange(0.01, 1., 0.01)
-        qq_gp = [np.less_equal(ground_truth.squeeze(), self.get_quantile(a)).mean() for a in qq_x]
+        qq_gp = [np.less_equal(ground_truth.squeeze()[:up_to], self.get_quantile(a)[:up_to]).mean() for a in qq_x]
         plt.plot(qq_x, qq_gp, color=col)
         plt.plot(qq_x, qq_x, '--', color='xkcd:green')
         plt.legend(['Continuous prediction', 'Ideal'])
@@ -659,8 +711,28 @@ class GaussianMixturePrediction(Prediction):
     def mse_mean(self, ground_truth):
         return mean_squared_error(ground_truth, self.draws.mean(axis=0))
 
+    def median_dtw_distance(self, ground_truth):
+        pred_median = self.get_quantile(0.5)
+        dist, path = fastdtw(pred_median, ground_truth, dist=euclidean)
+
+        return dist
+
+    def median_attractor_distance(self, ground_truth):
+        pred_median = self.get_quantile(0.5)
+        stacker = AttractorStacker(10)
+        pred_median_att = stacker.apply(pred_median).squeeze()
+        ground_truth_att = stacker.apply(ground_truth).squeeze()
+
+        d = pairwise_distances(pred_median_att, ground_truth_att)
+        return d.min(axis=0).sum()
+
     def quantile_mse(self, ground_truth, alpha=0.5):
         return mean_squared_error(ground_truth, self.get_quantile(alpha).squeeze())
+
+    def qq_dist(self, ground_truth, up_to=1000):
+        qq_x = np.arange(0.01, 1., 0.01)
+        qq_gp = [np.less_equal(ground_truth.squeeze()[:up_to], self.get_quantile(a)[:up_to]).mean() for a in qq_x]
+        return mean_squared_error(qq_x, qq_gp)
 
     def nll(self, ground_truth):
         """Computes NLL of drawing a time series from a GP sequential prediction"""
@@ -785,13 +857,20 @@ class GaussianMixturePrediction(Prediction):
         #plt.title('Empirical distribution function')
         #plt.colorbar()
 
-    def plot_qq(self, plt, ground_truth, col='xkcd:blue'):
+    def plot_qq(self, plt, ground_truth, up_to=1000, col='xkcd:blue'):
         qq_x = np.arange(0.01, 1., 0.01)
-        qq_gp = [np.less_equal(ground_truth.squeeze(), self.get_quantile(a)).mean() for a in qq_x]
+        qq_gp = [np.less_equal(ground_truth.squeeze()[:up_to], self.get_quantile(a)[:up_to]).mean() for a in qq_x]
         plt.plot(qq_x, qq_gp, color=col)
         plt.plot(qq_x, qq_x, '--', color='xkcd:green')
         plt.legend(['Continuous prediction', 'Ideal'])
         #plt.title('Uncertainty calibration plot for continuous prediction')
+
+    def plot_median_dtw_alignment(self, plt, ground_truth):
+        pred_median = self.get_quantile(0.5)
+        dist, path = fastdtw(pred_median, ground_truth, dist=euclidean)
+
+        plt.plot(np.array([pred_median[j] for i, j in path]))
+        plt.plot(np.array([ground_truth[i] for i, j in path]))
 
     @staticmethod
     def compatibility_univar_gaussian(old_pred, n_components):

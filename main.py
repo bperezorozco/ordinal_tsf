@@ -5,7 +5,7 @@ from ordinal_tsf.model import MordredStrategy
 from ordinal_tsf.dataset import Dataset, Quantiser, Standardiser, WhiteCorrupter, AttractorStacker, Selector, TestDefinition
 from ordinal_tsf.session import Session
 from ordinal_tsf.util import cartesian
-os.environ["CUDA_VISIBLE_DEVICES"]="3"
+os.environ["CUDA_VISIBLE_DEVICES"]="6"
 
 import tensorflow as tf
 from keras.backend.tensorflow_backend import set_session
@@ -68,10 +68,13 @@ for FNAME in ALL_DS:
 
     validation_tests = [TestDefinition('mse', continuous_ground_truth),
                         TestDefinition('nll', ordinal_ground_truth),
-                        TestDefinition('cum_nll', ordinal_ground_truth)]
+                        TestDefinition('cum_nll', ordinal_ground_truth),
+                        TestDefinition('median_dtw_distance', continuous_ground_truth),
+                        TestDefinition('median_attractor_distance', continuous_ground_truth)]
 
     validation_plots = {'plot_median_2std': {'ground_truth':continuous_ground_truth},
                         'plot_cum_nll': {'binned_ground_truth': ordinal_ground_truth},
+                        'plot_median_dtw_alignment': {'ground_truth': continuous_ground_truth},
                         'plot_like': {}}
 
     experiment = sess.start_experiment(dataset, MordredStrategy)
@@ -93,8 +96,13 @@ for FNAME in ALL_DS:
     ordinal_ground_truth = dataset.apply_partial_preprocessing('test', [selector, stand, quant])
 
     final_tests = [TestDefinition('mse', continuous_ground_truth),
-                   TestDefinition('nll', ordinal_ground_truth)]
+                   TestDefinition('nll', ordinal_ground_truth),
+                   TestDefinition('cum_nll', ordinal_ground_truth),
+                   TestDefinition('median_dtw_distance', continuous_ground_truth),
+                   TestDefinition('median_attractor_distance', continuous_ground_truth)]
+
     test_plots = {'plot_median_2std': {'ground_truth': continuous_ground_truth},
+                  'plot_median_dtw_alignment': {'ground_truth': continuous_ground_truth},
                   'plot_cum_nll': {'binned_ground_truth': ordinal_ground_truth},
                   'plot_like': {}}
 
@@ -112,6 +120,9 @@ for FNAME in ALL_DS:
 
 print best_models
 
-with open('best_models_mordred', 'wb') as f:
+#with open('best_models_mordred', 'wb') as f:
+#    pickle.dump(best_models, f)
+
+with open('best_models_attractor_mordred', 'wb') as f:
     pickle.dump(best_models, f)
 exit()

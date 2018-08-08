@@ -326,6 +326,11 @@ class Prediction(object):
     @abstractmethod
     def nll(self, ground_truth): pass
 
+    @staticmethod
+    def get_mase_norm_constant(tr_ts, m):
+        n = tr_ts.shape[0]
+        return np.abs(tr_ts[m:] - tr_ts[:-m]).sum() / (n - m)
+
 
 class OrdinalPrediction(Prediction):
     """Encapsulates a sequential ordinal predictive posterior distribution.
@@ -357,6 +362,40 @@ class OrdinalPrediction(Prediction):
         """Computes MSE between two real-valued time series"""
         # type: (np.ndarray) -> np.float
         return np.mean([mean_squared_error(ground_truth, p) for p in self.draws])
+
+    def smape_mean(self, ground_truth):
+        this_mean = self.ordinal_pdf.dot(self.bins).squeeze()
+        k = ground_truth.shape[0]
+        y_true = ground_truth.squeeze()
+        smape_vector = np.abs(y_true - this_mean) / (np.abs(y_true) + np.abs(this_mean))
+
+        return smape_vector.sum() * (2. / k)
+
+    def smape_quantile(self, ground_truth, alpha=0.5):
+        k = ground_truth.shape[0]
+        median = self.get_quantile(alpha).squeeze()
+        y_true = ground_truth.squeeze()
+        smape_vector = np.abs(y_true - median) / (np.abs(y_true) + np.abs(median))
+
+        return smape_vector.sum() * (2. / k)
+
+    def mase_mean(self, ground_truth, mase_norm_constant):
+        k = ground_truth.shape[0]
+        #mase_norm_constant = self.get_mase_norm_constant(ground_truth, 1)
+        this_mean = self.ordinal_pdf.dot(self.bins).squeeze()
+        y_true = ground_truth.squeeze()
+        mase_vector = np.abs(y_true - this_mean).sum() / k
+
+        return mase_vector / mase_norm_constant
+
+    def mase_quantile(self, ground_truth, mase_norm_constant, alpha=0.5):
+        k = ground_truth.shape[0]
+        #mase_norm_constant = self.get_mase_norm_constant(ground_truth, 1)
+        median = self.get_quantile(alpha).squeeze()
+        y_true = ground_truth.squeeze()
+        mase_vector = np.abs(y_true - median).sum() / k
+
+        return mase_vector / mase_norm_constant
 
     def mse_mean(self, ground_truth):
         return mean_squared_error(ground_truth, self.ordinal_pdf.dot(self.bins).squeeze())
@@ -425,6 +464,18 @@ class OrdinalPrediction(Prediction):
         plt.plot(ground_truth, 'xkcd:olive')
         plt.legend(['Quantile 0.025', 'Quantile 0.975', 'Median', 'True'])
 
+    def plot_mean_2std(self, plt, ground_truth):
+        """Plots a probabilistic forecast's median and 2.5, 97.5 quantiles alongside the corresponding ground truth"""
+        quantile_025 = self.get_quantile(0.025)
+        quantile_975 = self.get_quantile(0.975)
+        pred_mean = self.ordinal_pdf.dot(self.bins)
+
+        plt.plot(quantile_025, 'xkcd:orange')
+        plt.plot(quantile_975, 'xkcd:orange')
+        plt.plot(pred_mean, 'xkcd:maroon')
+        plt.plot(ground_truth, 'xkcd:olive')
+        plt.legend(['Quantile 0.025', 'Quantile 0.975', 'Mean', 'True'])
+
     def plot_like(self, plt, ground_truth=None):
         """Plots the full ordinal pdf as a heatmap"""
         if ground_truth is not None:
@@ -479,7 +530,7 @@ class OrdinalPrediction(Prediction):
         plt.plot(quantile_975, 'xkcd:azure')
         plt.plot(ground_truth, 'xkcd:coral')
         plt.imshow(self.ordinal_pdf.cumsum(axis=-1).T, origin='lower',
-                   extent=[0, 1000, self.bins.min(), self.bins.max()],
+                   extent=[0, ground_truth.shape[0], self.bins.min(), self.bins.max()],
                    aspect='auto', cmap=my_cmap)
         #plt.title('Empirical distribution function')
         #plt.colorbar()
@@ -561,6 +612,40 @@ class GaussianPrediction(Prediction):
 
         d = pairwise_distances(pred_median_att, ground_truth_att)
         return d.min(axis=0).sum()
+
+    def smape_mean(self, ground_truth):
+        this_mean = self.posterior_mean.squeeze()
+        y_true = ground_truth.squeeze()
+        k = ground_truth.shape[0]
+        smape_vector = np.abs(y_true - this_mean) / (np.abs(y_true) + np.abs(this_mean))
+
+        return smape_vector.sum() * (2. / k)
+
+    def smape_quantile(self, ground_truth, alpha=0.5):
+        k = ground_truth.shape[0]
+        y_true = ground_truth.squeeze()
+        median = self.get_quantile(alpha).squeeze()
+        smape_vector = np.abs(y_true - median) / (np.abs(y_true) + np.abs(median))
+
+        return smape_vector.sum() * (2. / k)
+
+    def mase_mean(self, ground_truth, mase_norm_constant):
+        k = ground_truth.shape[0]
+        y_true = ground_truth.squeeze()
+        #mase_norm_constant = self.get_mase_norm_constant(ground_truth, 1)
+        this_mean = self.posterior_mean.squeeze()
+        mase_vector = np.abs(y_true - this_mean).sum() / k
+
+        return mase_vector / mase_norm_constant
+
+    def mase_quantile(self, ground_truth, mase_norm_constant, alpha=0.5):
+        k = ground_truth.shape[0]
+        y_true = ground_truth.squeeze()
+        #mase_norm_constant = self.get_mase_norm_constant(ground_truth, 1)
+        median = self.get_quantile(alpha).squeeze()
+        mase_vector = np.abs(y_true - median).sum() / k
+
+        return mase_vector / mase_norm_constant
 
     def nll(self, ground_truth):
         """Computes NLL of drawing a time series from a GP sequential prediction"""
@@ -725,6 +810,40 @@ class GaussianMixturePrediction(Prediction):
 
         d = pairwise_distances(pred_median_att, ground_truth_att)
         return d.min(axis=0).sum()
+
+    def smape_mean(self, ground_truth):
+        this_mean = self.draws.mean(axis=0).squeeze()
+        y_true = ground_truth.squeeze()
+        k = ground_truth.shape[0]
+        smape_vector = np.abs(y_true - this_mean) / (np.abs(y_true) + np.abs(this_mean))
+
+        return smape_vector.sum() * (2. / k)
+
+    def smape_quantile(self, ground_truth, alpha=0.5):
+        k = ground_truth.shape[0]
+        y_true = ground_truth.squeeze()
+        median = self.get_quantile(alpha).squeeze()
+        smape_vector = np.abs(y_true - median) / (np.abs(y_true) + np.abs(median))
+
+        return smape_vector.sum() * (2. / k)
+
+    def mase_mean(self, ground_truth, mase_norm_constant):
+        k = ground_truth.shape[0]
+        y_true = ground_truth.squeeze()
+        #mase_norm_constant = self.get_mase_norm_constant(ground_truth, 1)
+        this_mean = self.draws.mean(axis=0).squeeze()
+        mase_vector = np.abs(y_true - this_mean).sum() / k
+
+        return mase_vector / mase_norm_constant
+
+    def mase_quantile(self, ground_truth, mase_norm_constant, alpha=0.5):
+        k = ground_truth.shape[0]
+        #mase_norm_constant = self.get_mase_norm_constant(ground_truth, 1)
+        y_true = ground_truth.squeeze()
+        median = self.get_quantile(alpha).squeeze()
+        mase_vector = np.abs(y_true - median).sum() / k
+
+        return mase_vector / mase_norm_constant
 
     def quantile_mse(self, ground_truth, alpha=0.5):
         return mean_squared_error(ground_truth, self.get_quantile(alpha).squeeze())

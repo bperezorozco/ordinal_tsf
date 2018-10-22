@@ -5,7 +5,7 @@ from ordinal_tsf.model import MordredStrategy
 from ordinal_tsf.dataset import Dataset, Quantiser, Standardiser, WhiteCorrupter, AttractorStacker, Selector, TestDefinition
 from ordinal_tsf.session import Session
 from ordinal_tsf.util import cartesian
-os.environ["CUDA_VISIBLE_DEVICES"]="6"
+os.environ["CUDA_VISIBLE_DEVICES"]="7"
 
 import tensorflow as tf
 from keras.backend.tensorflow_backend import set_session

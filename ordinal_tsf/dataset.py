@@ -397,6 +397,12 @@ class OrdinalPrediction(Prediction):
 
         return mase_vector / mase_norm_constant
 
+    def rmse_quantile(self, ground_truth, alpha=0.5):
+        return np.sqrt(mean_squared_error(ground_truth, self.get_quantile(alpha).squeeze()))
+
+    def rmse_mean(self, ground_truth):
+        return np.sqrt(mean_squared_error(ground_truth, self.ordinal_pdf.dot(self.bins).squeeze()))
+
     def mse_mean(self, ground_truth):
         return mean_squared_error(ground_truth, self.ordinal_pdf.dot(self.bins).squeeze())
 
@@ -591,6 +597,12 @@ class GaussianPrediction(Prediction):
         """Computes MSE between two real-valued time series"""
         # type: (np.ndarray) -> np.float
         return np.mean([mean_squared_error(ground_truth, p) for p in self.draws])
+
+    def rmse_quantile(self, ground_truth, alpha=0.5):
+        return np.sqrt(mean_squared_error(ground_truth, self.get_quantile(alpha).squeeze()))
+
+    def rmse_mean(self, ground_truth):
+        return np.sqrt(mean_squared_error(ground_truth, self.posterior_mean))
 
     def mse_mean(self, ground_truth):
         return mean_squared_error(ground_truth, self.posterior_mean)
@@ -795,6 +807,12 @@ class GaussianMixturePrediction(Prediction):
 
     def mse_mean(self, ground_truth):
         return mean_squared_error(ground_truth, self.draws.mean(axis=0))
+
+    def rmse_quantile(self, ground_truth, alpha=0.5):
+        return np.sqrt(mean_squared_error(ground_truth, self.get_quantile(alpha).squeeze()))
+
+    def rmse_mean(self, ground_truth):
+        return np.sqrt(mean_squared_error(ground_truth, self.draws.mean(axis=0).squeeze()))
 
     def median_dtw_distance(self, ground_truth):
         pred_median = self.get_quantile(0.5)

@@ -311,7 +311,7 @@ class Quantiser(DatasetPreprocessingStep):
             self.fit(ts)
         assert is_univariate(ts), 'Only univariate time series can be quantised. Current shape: {}'.format(ts.shape)
 
-        if (ts.max() > self.bins[-1]) or (ts.min() < self.bins[0]):
+        if (ts.max() > (self.bins[-1]+self.delta)) or (ts.min() < (self.bins[0]-self.delta)):
             print("WARNING: You are trying to quantise a time series that has observations outside the quantisation "
                   "range. BE CAREFUL as This may lead to inaccurate results.")
 

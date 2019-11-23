@@ -2,17 +2,21 @@ from abc import ABCMeta, abstractmethod
 from sklearn.metrics import mean_squared_error
 from sklearn.metrics.pairwise import pairwise_distances
 from matplotlib.colors import ListedColormap
-from util import assert_sum_one, all_satisfy, frame_ts, is_univariate, frame_generator, frame_generator_list
+from ordinal_tsf.util import assert_sum_one, all_satisfy, frame_ts, is_univariate, frame_generator, frame_generator_list, gmm_marginal_pdf
 import pickle
 import numpy as np
 import seaborn as sns
-from scipy.stats import norm
+from scipy.stats import norm, multivariate_normal
 from scipy.spatial.distance import euclidean
-from functools import partial
-from sklearn.mixture import BayesianGaussianMixture
+from functools import partial, reduce
+from sklearn.mixture import BayesianGaussianMixture, GaussianMixture
+from sklearn.neighbors import KernelDensity
+from sklearn.cluster import KMeans
 from fastdtw import fastdtw
 import copy
-
+from mpl_toolkits.mplot3d import Axes3D
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+from matplotlib.colors import LogNorm
 
 class Dataset(object):
     """Handler for a time series dataset and its different representations."""
@@ -126,29 +130,39 @@ class Dataset(object):
 
 class TimeSeriesSetDataset(object):
     """This handler takes a list of time series and treats each of them as an individual subdataset"""
-    def __init__(self, ts_list, frame_length, p_train=0.7, p_val=0.15, p_test=0.15, preprocessing_steps=[]):
+    def __init__(self, ts_list, frame_length, p_train=0.7, p_val=0.15, p_test=0.15,
+                 preprocessing_steps=[],
+                 multichannel_preprocessing_steps = [],
+                 frame_gen_func=frame_generator_list):
         # type: (List[np.ndarray], int, float, float, float, List[DatasetPreprocessingStep]) -> TimeSeriesSetDataset
 
         assert [raw_ts.ndim == 2 and raw_ts.shape[0] > frame_length for raw_ts in ts_list], \
             'Please provide only univariate time series as input to Dataset.'
 
-        self.raw_ts_list = []
+        self.raw_train_list = []
+        self.raw_val_list = []
+        self.raw_test_list = []
         self.frame_length = frame_length
         self.train_ts = []
         self.val_ts = []
         self.test_ts = []
+        self.optional_params = {'is_list': True}
         self.optional_params_list = []
         self.preprocessing_steps_list = []
         self.frame_length = frame_length
 
         for ts in ts_list:
-            self.raw_ts_list += [ts.copy()]
             n_train = int(p_train * ts.shape[0])
             n_train_val = int((p_train + p_val) * ts.shape[0])
 
             cur_train_ts = ts[:n_train]
             cur_val_ts = ts[n_train:n_train_val]
             cur_test_ts = ts[n_train_val:]
+
+            self.raw_train_list += [cur_train_ts.copy()]
+            self.raw_val_list += [cur_val_ts.copy()]
+            self.raw_test_list += [cur_test_ts.copy()]
+
             current_optional_params = {}
             current_preproc_steps = []
 
@@ -168,9 +182,28 @@ class TimeSeriesSetDataset(object):
             self.test_ts += [cur_test_ts]
             self.preprocessing_steps_list += [current_preproc_steps]
 
-        self.train_frames = partial(frame_generator_list, ts_list=self.train_ts, frame_length=frame_length)
-        self.val_frames = partial(frame_generator_list, ts_list=self.val_ts, frame_length=frame_length)
-        self.test_frames = partial(frame_generator_list, ts_list=self.test_ts, frame_length=frame_length)
+        self.train_frames = partial(frame_gen_func, ts_list=self.train_ts, frame_length=frame_length)
+        self.val_frames = partial(frame_gen_func, ts_list=self.val_ts, frame_length=frame_length)
+        self.test_frames = partial(frame_gen_func, ts_list=self.test_ts, frame_length=frame_length)
+
+    def apply_partial_preprocessing(self, mode, enabled_steps):
+        """Queries a specific representation of the given dataset
+
+        Applies a pipeline of preprocessing steps to obtain a dataset representation."""
+        # type: (str, List[DatasetPreprocessingStep]) -> np.ndarray
+        assert mode in ['train', 'test', 'val'], "Mode must be one of [train, val, test]"
+
+        if mode == 'val':
+            ts = self.raw_val_list.copy()
+        elif mode == 'test':
+            ts = self.raw_test_list.copy()
+        else:
+            ts = self.raw_train_list.copy()
+
+        for step in enabled_steps:
+            ts = step.apply(ts)
+
+        return ts
 
 
 class DatasetPreprocessingStep(object):
@@ -230,37 +263,74 @@ class Standardiser(DatasetPreprocessingStep):
         return (ts - self.mean) / self.std
 
     def fit(self, ts):
-        self.mean = ts.mean()
-        self.std = ts.std()
+        self.mean = np.nanmean(ts)
+        self.std = np.nanstd(ts)
         self.param_dict = {'ts_mean': self.mean,
                            'ts_std': self.std,
                            'zero_mean_unit_var':True}
         self.is_fitted = True
 
 
+class MultivarStandardiser(DatasetPreprocessingStep):
+    """Makes a time series zero-mean, unit-variance"""
+    def __init__(self):
+        self.mean = None
+        self.std = None
+
+    def apply(self, ts):
+        if isinstance(ts,(list,)):
+            ts = np.stack(ts, axis=-1)
+
+        if not self.is_fitted: self.fit(ts)
+
+        return (ts - self.mean) / self.std
+
+    def fit(self, ts):
+        if isinstance(ts,(list,)):
+            ts = np.stack(ts, axis=-1)
+
+        self.mean = np.nanmean(ts, axis=0)
+        self.std = np.nanstd(ts, axis=0)
+        self.param_dict = {'ts_mean': self.mean,
+                           'ts_std': self.std,
+                           'zero_mean_unit_var':True}
+
+        self.is_fitted = True
+
+
 class Quantiser(DatasetPreprocessingStep):
     """Computes ordinal bins and allocates each observation in the time series."""
-    def __init__(self, n_bins=None, delta=1e-3):
+    def __init__(self, n_bins=None, delta=1e-3, frame_generator=True):
         self.n_bins = n_bins
         self.delta = delta
         self.bins = None
+        self.frame_generator = frame_generator
 
     def apply(self, ts):
         if not self.is_fitted:
             self.fit(ts)
         assert is_univariate(ts), 'Only univariate time series can be quantised. Current shape: {}'.format(ts.shape)
 
+        if (ts.max() > self.bins[-1]) or (ts.min() < self.bins[0]):
+            print("WARNING: You are trying to quantise a time series that has observations outside the quantisation "
+                  "range. BE CAREFUL as This may lead to inaccurate results.")
+
+        na_mask = np.isnan(ts)
+
         out = np.zeros((ts.shape[0], self.n_bins))
         digits = np.searchsorted(self.bins[:-1], ts.squeeze())
 
         for i, i_d in enumerate(digits):
-            out[i, i_d] = 1.
+            if na_mask[i]:
+                out[i, :] = np.nan
+            else:
+                out[i, i_d] = 1.
 
         return out
 
     def fit(self, ts):
-        ts_max = ts.max()
-        ts_min = ts.min()
+        ts_max = np.nanmax(ts)
+        ts_min = np.nanmin(ts)
 
         if self.n_bins is None:
             self.n_bins = self.__find_n_bins(ts)
@@ -270,25 +340,201 @@ class Quantiser(DatasetPreprocessingStep):
         self.param_dict = {'bins': self.bins,
                            'bin_delta':self.bins[1]-self.bins[0],
                            'is_ordinal': True,
-                           'frame_generator': True}
+                           'frame_generator': self.frame_generator}
 
         self.is_fitted = True
 
     def __find_n_bins(self, ts):
         # type: (np.ndarray) -> int
         MAX_ALLOWED = 300
-        MIN_ALLOWED = 50
+        MIN_ALLOWED = 10
         n_bins = np.unique(ts.squeeze()).shape[0]
 
         if n_bins < MAX_ALLOWED and n_bins > MIN_ALLOWED:
             return n_bins
 
-        ts_max = ts.max()
-        ts_min = ts.min()
+        ts_max = np.nanmax(ts)
+        ts_min = np.nanmin(ts)
         n_bins = int((ts_max - ts_min) / self.delta)
         n_bins = max(min(MAX_ALLOWED, n_bins), MIN_ALLOWED)
 
         return n_bins
+
+
+class QuantiserArray(DatasetPreprocessingStep):
+    """Computes ordinal bins and allocates each observation in the time series."""
+
+    def __init__(self, n_bins=None, delta=1e-3, frame_generator=True):
+        self.n_bins = n_bins
+        self.delta = delta
+        self.bins = None
+        self.frame_generator = frame_generator
+        self.quantisers = []
+
+    def apply(self, ts):
+        if not self.is_fitted:
+            self.fit(ts)
+
+        return np.stack([q.apply(ts[:, i_q:i_q + 1]) for i_q, q in enumerate(self.quantisers)], axis=-1)
+
+    def fit(self, ts):
+        for i_q in range(ts.shape[-1]):
+            q = Quantiser(n_bins=self.n_bins, delta=self.delta, frame_generator=self.frame_generator)
+            q.fit(ts[:, i_q:i_q + 1])
+            self.quantisers += [q]
+
+        self.n_bins = [q.n_bins for q in self.quantisers]
+        self.bins = [q.bins for q in self.quantisers]
+
+        self.param_dict = {'is_ordinal': True,
+                           'frame_generator': self.frame_generator,
+                           'is_array': True,
+                           'n_channels': ts.shape[-1],
+                           'bins': self.bins
+                           }
+
+        self.is_fitted = True
+
+
+class KMeansQuantiser(DatasetPreprocessingStep):
+    """Quantises a time series using the KMeans method"""
+    def __init__(self, n_clusters=150, n_init=5):
+        self.n_clusters = n_clusters
+        self.n_init = n_init
+        self.model = None
+
+    def fit(self, ts):
+        self.model = KMeans(n_clusters=self.n_clusters, n_init=self.n_init).fit(ts)
+        self.param_dict = {'centroids': self.model.cluster_centers_,
+                           'n_centroids': self.n_clusters,
+                           'frame_generator': True}
+        self.is_fitted = True
+
+    def apply(self, ts):
+        if not self.is_fitted:
+            self.fit(ts)
+
+        cluster_ids = self.model.predict(ts)
+        out = np.zeros((ts.shape[0], self.n_clusters))
+
+        for i, i_d in enumerate(cluster_ids):
+            out[i, i_d] = 1.
+
+        return out
+
+    def apply_decoder(self, weights, f_decoder=None):
+        if f_decoder is None:
+            return self.replace_with_centroids(weights, self.param_dict['centroids'])
+
+        return f_decoder(weights, self.param_dict['centroids'])
+
+    @staticmethod
+    def replace_with_centroids(draw, centroids):
+        return np.stack([centroids[k] for k in draw])
+
+    @staticmethod
+    def replace_with_weighted_mean(weights, centroids):
+        return weights.dot(centroids)
+
+    @staticmethod
+    def replace_with_weighted_mode(weights, centroids):
+        modes = weights.argmax(axis=-1)
+        return np.stack([centroids[i] for i in modes])
+
+
+class GMMQuantiser(DatasetPreprocessingStep):
+    """Quantises a time series using the Variational GMM method"""
+
+    def __init__(self, n_clusters=150, n_init=5, weight_concentration_prior=500):
+        self.n_clusters = n_clusters
+        self.n_init = n_init
+        self.model = None
+        self.wcp = weight_concentration_prior
+
+    def fit(self, ts):
+        self.model = GaussianMixture(n_components=self.n_clusters, max_iter=200, n_init=self.n_init).fit(ts)
+
+        self.param_dict = {'centroids': self.model.means_,
+                           'covariances': self.model.covariances_,
+                           'n_centroids': self.n_clusters,
+                           'frame_generator': True}
+        self.is_fitted = True
+
+    def apply(self, ts):
+        if not self.is_fitted:
+            self.fit(ts)
+
+        cluster_ids = self.model.predict(ts)
+        out = np.zeros((ts.shape[0], self.n_clusters))
+
+        for i, i_d in enumerate(cluster_ids):
+            out[i, i_d] = 1.
+
+        return out
+
+    def compute_bin_proba(self, samples):
+        return self.model.predict_proba(samples)
+
+    def apply_decoder(self, weights, f_decoder=None):
+        if f_decoder is None:
+            return self.replace_with_centroids(weights, self.param_dict['centroids'])
+
+        return f_decoder(weights, self.param_dict['centroids'])
+
+    @staticmethod
+    def replace_with_centroids(draw, centroids):
+        return np.stack([centroids[k] for k in draw])
+
+    @staticmethod
+    def replace_with_weighted_mean(weights, centroids):
+        return weights.dot(centroids)
+
+
+class VBGMMQuantiser(DatasetPreprocessingStep):
+    """Quantises a time series using the GMM method"""
+
+    def __init__(self, n_clusters=150, n_init=5, weight_concentration_prior=500):
+        self.n_clusters = n_clusters
+        self.n_init = n_init
+        self.model = None
+        self.wcp = weight_concentration_prior
+
+    def fit(self, ts):
+        self.model = BayesianGaussianMixture(n_components=self.n_clusters, max_iter=200, n_init=self.n_init,
+                                             weight_concentration_prior_type='dirichlet_distribution',
+                                             weight_concentration_prior=self.wcp).fit(ts)
+
+        self.param_dict = {'centroids': self.model.means_,
+                           'covariances': self.model.covariances_,
+                           'n_centroids': self.n_clusters,
+                           'frame_generator': True}
+        self.is_fitted = True
+
+    def apply(self, ts):
+        if not self.is_fitted:
+            self.fit(ts)
+
+        cluster_ids = self.model.predict(ts)
+        out = np.zeros((ts.shape[0], self.n_clusters))
+
+        for i, i_d in enumerate(cluster_ids):
+            out[i, i_d] = 1.
+
+        return out
+
+    def apply_decoder(self, weights, f_decoder=None):
+        if f_decoder is None:
+            return self.replace_with_centroids(weights, self.param_dict['centroids'])
+
+        return f_decoder(weights, self.param_dict['centroids'])
+
+    @staticmethod
+    def replace_with_centroids(draw, centroids):
+        return np.stack([centroids[k] for k in draw])
+
+    @staticmethod
+    def replace_with_weighted_mean(weights, centroids):
+        return weights.dot(centroids)
 
 
 class AttractorStacker(DatasetPreprocessingStep):
@@ -330,6 +576,175 @@ class Prediction(object):
     def get_mase_norm_constant(tr_ts, m):
         n = tr_ts.shape[0]
         return np.abs(tr_ts[m:] - tr_ts[:-m]).sum() / (n - m)
+
+
+class StateDensity(object):
+    """Provides a common interface for the output predictions of different forecasting strategies    """
+    __metaclass__ = ABCMeta
+
+    @abstractmethod
+    def pdf(self, x): pass
+
+
+class MultivariateOrdinalPrediction(Prediction):
+    type = 'multi_ordinal'
+
+    def __init__(self, quant, ordinal_pdf, draws, n_x=250):
+        self.ordinal_pdf = ordinal_pdf
+        self.quant = quant
+        self.mean = quant.apply_decoder(ordinal_pdf, quant.replace_with_weighted_mean)
+        bins = quant.param_dict['centroids']
+        self.draws = quant.apply_decoder(draws, quant.replace_with_centroids)
+        self.n_channels = bins.shape[-1]
+        self.channel_ranges = []
+        self.channel_densities = []
+        self.gmm_marginals = []
+
+        for i_channel in range(self.n_channels):
+            this_range = np.linspace(self.draws[:, :, i_channel].min(),
+                                     self.draws[:, :, i_channel].max(),
+                                     n_x)[:, np.newaxis]
+            this_delta = this_range[1] - this_range[0]
+
+            this_channel_marginals = [norm(loc=quant.model.means_[k, i_channel],
+                                           scale=np.sqrt(quant.model.covariances_[k, i_channel, i_channel]))
+                                      for k in range(ordinal_pdf.shape[1])]
+
+            this_channel_density = gmm_marginal_pdf(this_range, this_channel_marginals, ordinal_pdf, this_delta)
+
+            self.channel_ranges += [this_range]
+            self.channel_densities += [this_channel_density]
+            self.gmm_marginals += [this_channel_marginals]
+
+    def plot_channel_like(self, plt, y_true):
+        fig, axes = plt.subplots(self.n_channels)
+
+        for i_channel in range(self.n_channels):
+            im = axes[i_channel].imshow(self.channel_densities[i_channel].T, origin='lower',
+                                        extent=[0, self.channel_densities[i_channel].shape[0],
+                                                self.channel_ranges[i_channel][0],
+                                                self.channel_ranges[i_channel][-1]],
+                                        aspect='auto', cmap='Blues')
+            axes[i_channel].plot(y_true[:, i_channel], color='xkcd:green')
+            axes[i_channel].plot(self.mean[:, i_channel], color='xkcd:orange')
+            axes[i_channel].plot(self.get_ordinal_quantile(self.channel_densities[i_channel],
+                                                           self.channel_ranges[i_channel], 0.5),
+                                 color='xkcd:crimson')
+            axes[i_channel].plot(self.get_ordinal_quantile(self.channel_densities[i_channel],
+                                                           self.channel_ranges[i_channel], 0.025),
+                                 color='xkcd:crimson')
+            axes[i_channel].plot(self.get_ordinal_quantile(self.channel_densities[i_channel],
+                                                           self.channel_ranges[i_channel], 0.975),
+                                 color='xkcd:crimson')
+            fig.colorbar(im, ax=axes[i_channel])
+            # plt.colorbar()
+
+    def plot_channel_cdf(self, plt, y_true):
+        fig, axes = plt.subplots(self.n_channels)
+        c_pal = sns.color_palette('Blues', n_colors=125).as_hex()
+        my_cmap = ListedColormap(c_pal + c_pal[::-1][1:])
+
+        for i_channel in range(self.n_channels):
+            im = axes[i_channel].imshow(self.channel_densities[i_channel].cumsum(axis=-1).T, origin='lower',
+                                        extent=[0, self.channel_densities[i_channel].shape[0],
+                                                self.channel_ranges[i_channel][0],
+                                                self.channel_ranges[i_channel][-1]],
+                                        aspect='auto', cmap=my_cmap)
+            axes[i_channel].plot(y_true[:, i_channel], color='xkcd:green')
+            axes[i_channel].plot(self.mean[:, i_channel], color='xkcd:orange')
+            axes[i_channel].plot(self.get_ordinal_quantile(self.channel_densities[i_channel],
+                                                           self.channel_ranges[i_channel], 0.5),
+                                 color='xkcd:crimson')
+            axes[i_channel].plot(self.get_ordinal_quantile(self.channel_densities[i_channel],
+                                                           self.channel_ranges[i_channel], 0.025),
+                                 color='xkcd:crimson')
+            axes[i_channel].plot(self.get_ordinal_quantile(self.channel_densities[i_channel],
+                                                           self.channel_ranges[i_channel], 0.975),
+                                 color='xkcd:crimson')
+            fig.colorbar(im, ax=axes[i_channel])
+
+    def plot_decoded(self, plt, y_true):
+        fig = plt.figure()
+
+        if y_true.shape[1] == 3:
+            ax = fig.gca(projection='3d')
+            ax.plot(y_true[:, 0], y_true[:, 1], y_true[:, 2], '.', color='xkcd:crimson')
+            ax.plot(self.mean[:, 0], self.mean[:, 1], self.mean[:, 2], '.', color='xkcd:blue')
+        elif y_true.shape[1] == 2:
+            ax = fig.gca()
+            ax.plot(y_true[:, 0], y_true[:, 1], '.', color='xkcd:crimson')
+            ax.plot(self.mean[:, 0], self.mean[:, 1], '.', color='xkcd:blue')
+        else:
+            print('Incorrect number of channels')
+
+    def plot_channels(self, plt, y_true):
+        fig, axes = plt.subplots(y_true.shape[-1])
+
+        for i_ax, ax in enumerate(axes):
+            ax.plot(self.mean[:, i_ax], color='xkcd:blue')
+            ax.plot(y_true[:, i_ax], color='xkcd:crimson')
+
+    def get_ordinal_quantile(self, pdf, x_range, alpha):
+        cdf = pdf.cumsum(axis=-1)
+        quantile = np.array([x_range[j] for j in (cdf >= alpha).argmax(axis=-1)])
+        quantile[cdf[:, -1] < alpha] = x_range[-1]
+
+        return quantile
+
+    def rmse_mean(self, ground_truth):
+        return np.sqrt(mean_squared_error(ground_truth, self.mean.squeeze()))
+
+    def mse(self):
+        pass
+
+    def nll(self, y_true):
+        #bin_proba = self.quant.compute_bin_proba(y_true)
+
+        bin_proba = np.stack([multivariate_normal.pdf(y_true,
+                                                 self.quant.model.means_[k_mix],
+                                                 self.quant.model.covariances_[k_mix])
+                         for k_mix in range(self.quant.model.means_.shape[0])], axis=1)
+
+        p_ground_truth = (bin_proba * self.ordinal_pdf).sum(axis=-1)
+        return (-np.log(p_ground_truth)).sum()
+
+
+# This is used when you have independent models for each time series channel and then want to
+# integrate into a single prediction
+class PredictionList(Prediction):
+    def __init__(self, predictions):
+        self.n_ar_channels = len(predictions)
+        self.predictions = predictions
+
+    def mse(self, ground_truth): return 0.
+
+    def nll(self, ground_truth): return 0.
+
+    def rmse_mean(self, ground_truth):
+        # ground_truth \in (timesteps, channels)
+        mse = np.array([pred.rmse_mean(ground_truth[i_pred]) for i_pred, pred in enumerate(self.predictions)])
+        return mse.mean()
+
+    def plot_channel_like(self, plt, ground_truth):
+        fig, axes = plt.subplots(self.n_ar_channels)
+
+        if self.n_ar_channels == 1:
+            axes = [axes]
+
+        for i_pred, pred in enumerate(self.predictions):
+            pred.plot_empirical(axes[i_pred], ground_truth[i_pred])
+
+    def plot_median_2std(self, plt, ground_truth):
+        fig, axes = plt.subplots(self.n_ar_channels)
+
+        if self.n_ar_channels == 1:
+            axes = [axes]
+
+        for i_pred, pred in enumerate(self.predictions):
+            pred.plot_median_2std(axes[i_pred], ground_truth[i_pred])
+
+    def ordinal_marginal_nll(self, ordinal_ground_truth):
+        return np.array([pred.nll(ordinal_ground_truth[i]) for i, pred in enumerate(self.predictions)])
 
 
 class OrdinalPrediction(Prediction):
@@ -524,7 +939,7 @@ class OrdinalPrediction(Prediction):
         plt.plot(quantile_975, 'xkcd:orange')
         plt.plot(quantile_median, 'xkcd:maroon')
         plt.plot(ground_truth, 'xkcd:olive')
-        plt.legend(['Quantile 0.025', 'Quantile 0.975', 'Median', 'True'])
+        plt.legend(['Quantile 0.025', 'Quantile 0.975', 'Median', 'True'], bbox_to_anchor=(1., 1.))
 
     def plot_empirical(self, plt, ground_truth):
         c_pal = sns.color_palette('Blues', n_colors=150).as_hex()
@@ -554,7 +969,6 @@ class OrdinalPrediction(Prediction):
     def plot_median_dtw_alignment(self, plt, ground_truth):
         pred_median = self.get_quantile(0.5)
         dist, path = fastdtw(pred_median, ground_truth, dist=euclidean)
-
         plt.plot(np.array([pred_median[j] for i, j in path]))
         plt.plot(np.array([ground_truth[i] for i, j in path]))
 
@@ -563,6 +977,116 @@ class OrdinalPrediction(Prediction):
         new_pred = OrdinalPrediction(old_pred.ordinal_pdf, [], old_pred.bins)
         new_pred.draws = old_pred.draws
         return new_pred
+
+
+# This is used when you have a shared LSTM layer and only individual fully connected layers
+# for each output channel
+class OrdinalArrayPrediction(Prediction):
+    type = 'ordinal_array'
+
+    def __init__(self, ordinal_pdf, draws, bins, vbgmm_max_components=5):
+        self.predictions = []
+        self.n_channels = ordinal_pdf.shape[-1]
+        self.vbgmm_components = vbgmm_max_components
+        for i in range(ordinal_pdf.shape[-1]):
+            self.predictions += [OrdinalPrediction(ordinal_pdf[:, :, i],
+                                                   draws[:, :, i],
+                                                   bins[i])]
+        self.draws = np.stack([pred.draws for pred in self.predictions], axis=-1)
+        self.vbgmm = [BayesianGaussianMixture(vbgmm_max_components, n_init=3, max_iter=200).fit(self.draws[:, t])
+                      for t in range(self.draws.shape[1])]
+        x_mins = [b[0] for b in bins]
+        x_max = [b[-1] for b in bins]
+        self.x_ranges = np.stack([np.linspace(xmi, xma, 1000) for xmi, xma in zip(x_mins, x_max)], axis=-1)
+
+    def get_quantile(self, alpha):
+        """Computes \alpha-quantiles given the object's posterior mean and standard deviation"""
+        # type: (float) -> np.ndarray
+        all_quantiles = []
+        for i_ch in range(self.n_channels):
+            this_quantile = [self.x_ranges[q, i_ch]
+                              for q in (self.all_ch_cdf[:, :, i_ch] >= alpha).argmax(axis=-1)] # shape: (n_ts, n_ts_range, n_channels)
+            this_quantile = np.array(this_quantile)
+            msk = (self.all_ch_cdf[:, -1, i_ch] < alpha)
+            this_quantile[msk] = self.x_ranges[-1, i_ch]
+            all_quantiles += [this_quantile]
+
+        return np.stack(all_quantiles, axis=-1)
+
+    def mse(self, ground_truth):
+        """Computes MSE between two real-valued time series"""
+        # type: (np.ndarray) -> np.float
+        return np.mean([pred.mse(ground_truth[:, :, i]) for i, pred in enumerate(self.predictions)])
+
+    def smape_mean(self, ground_truth):
+        return -1.
+
+    def rmse_quantile(self, ground_truth, alpha=0.5):
+        return np.mean([pred.rmse_quantile(ground_truth[:, i], alpha) for i, pred in enumerate(self.predictions)])
+
+    def rmse_mean(self, ground_truth):
+        return np.mean([pred.rmse_mean(ground_truth[:, i]) for i, pred in enumerate(self.predictions)])
+
+    def nll(self, ground_truth):
+        """Computes NLL of drawing a time series from a piecewise uniform sequential prediction"""
+        # type: (np.ndarray) -> np.float
+        return -np.sum([self.vbgmm[t].score(ground_truth[t:t+1]) for t in range(self.draws.shape[1])])
+        #return np.sum([pred.nll(binned_ground_truth[:, :, i])
+        #               for i, pred in enumerate(self.predictions)])
+
+    def plot_median_2std(self, plt, ground_truth):
+        fig, axes = plt.subplots(self.n_channels)
+        for i_pred, pred in enumerate(self.predictions):
+            pred.plot_median_2std(axes[i_pred], ground_truth[:, i_pred])
+
+    def plot_decoded(self, plt, ground_truth):
+        fig = plt.figure()
+        ax = fig.add_subplot(111, projection='3d')
+        #[ax.plot(*d.T, linestyle='', marker='.', color='xkcd:blue', alpha=0.01) for d in self.draws]
+        ax.plot(*self.draws.mean(axis=0).T, linestyle='', marker='.', color='xkcd:blue')
+        ax.plot(*ground_truth.T, linestyle='-', marker='.', color='xkcd:crimson')
+
+    def plot_channel_like(self, plt, ground_truth):
+        fig, axes = plt.subplots(self.n_channels)
+
+        for i_pred, pred in enumerate(self.predictions):
+            pred.plot_empirical(axes[i_pred], ground_truth[:, i_pred])
+
+    def plot_draws_quantiles(self, plt, ground_truth):
+        fig, axes = plt.subplots(self.n_channels)
+
+        for i_pred, pred in enumerate(self.predictions):
+            pred.plot_draws_quantiles(axes[i_pred], ground_truth[:, i_pred])
+
+    def factorised_ordinal_joint_nll(self, ordinal_ground_truth):
+        return np.sum([pred.nll(ordinal_ground_truth[:, :, i]) for i, pred in enumerate(self.predictions)])
+
+    def ordinal_marginal_nll(self, ordinal_ground_truth):
+        return np.array([pred.nll(ordinal_ground_truth[:, :, i]) for i, pred in enumerate(self.predictions)])
+
+    def vbgmm_joint_nll(self, ground_truth):
+        return -np.sum([self.vbgmm[t].score(ground_truth[t:t + 1]) for t in range(self.draws.shape[1])])
+
+    def vbgmm_marginal_nll(self, ground_truth):
+        all_ch_like = []
+        for i_ch in range(self.n_channels):
+            ch_like = []
+            for t in range(ground_truth.shape[0]):
+                cur_ch_like = 0.
+                for k_mix in range(self.vbgmm[t].weights_.shape[0]):
+                    cur_ch_like += self.vbgmm[t].weights_[k_mix] * norm.pdf(ground_truth[t:t + 1, i_ch],
+                                                                           loc=self.vbgmm[t].means_[k_mix, i_ch],
+                                                                           scale=np.sqrt(self.vbgmm[t].covariances_[k_mix,
+                                                                                                                i_ch,
+                                                                                                                i_ch]))
+                ch_like += [cur_ch_like]
+            all_ch_like += [-np.log(ch_like).sum()]
+
+        return all_ch_like
+
+
+class StatePrediction(Prediction):
+    type = 'state'
 
 
 class GaussianPrediction(Prediction):
@@ -894,6 +1418,7 @@ class GaussianMixturePrediction(Prediction):
     def get_quantile(self, alpha):
         """Computes \alpha-quantiles given the object's posterior mean and standard deviation"""
         # type: (float) -> np.ndarray
+        quantile = np.array([self.ts_range[j] for j in (self.cdf >= alpha).argmax(axis=-1)])
 
         return np.array([self.ts_range[j] for j in (self.cdf >= alpha).argmax(axis=-1)])
 
@@ -991,7 +1516,7 @@ class GaussianMixturePrediction(Prediction):
         plt.imshow(self.cdf.T, origin='lower',
                    extent=[0, self.cdf.shape[0], self.ts_range.min(), self.ts_range.max()],
                    aspect='auto', cmap=my_cmap)
-        #plt.title('Empirical distribution function')
+        plt.title('Empirical distribution function')
         #plt.colorbar()
 
     def plot_qq(self, plt, ground_truth, up_to=1000, col='xkcd:blue'):
@@ -1018,6 +1543,202 @@ class GaussianMixturePrediction(Prediction):
         return GaussianMixturePrediction(old_pred.draws, old_pred.n_components, old_pred.vbgmms)
 
 
+class MultivarVBGMMPrediction(Prediction):
+    type = 'multi_vbgmm'
+
+    def __init__(self, draws, x_ranges, vbgmms=None, n_components=5):
+        self.draws = draws
+        self.n_channels = draws.shape[-1]
+        self.predictive_horizon = draws.shape[1]
+
+        if vbgmms is not None:
+            self.vbgmm = vbgmms
+        else:
+            self.vbgmm = [BayesianGaussianMixture(n_components, n_init=5, max_iter=200).fit(draws[:, t])
+                        for t in range(self.predictive_horizon)]
+        self.x_ranges = np.stack(x_ranges, axis=-1)
+        self.all_ch_like = self.eval_marginal_like(self.x_ranges)
+        self.all_ch_cdf = self.eval_marginal_cdf(self.x_ranges) # shape: (n_ts, n_ts_range, n_channels)
+        self.pred_mean = self.draws.mean(axis=0)
+
+    def get_quantile(self, alpha):
+        """Computes \alpha-quantiles given the object's posterior mean and standard deviation"""
+        # type: (float) -> np.ndarray
+        all_quantiles = []
+        for i_ch in range(self.n_channels):
+            this_quantile = [self.x_ranges[q, i_ch]
+                              for q in (self.all_ch_cdf[:, :, i_ch] >= alpha).argmax(axis=-1)] # shape: (n_ts, n_ts_range, n_channels)
+            this_quantile = np.array(this_quantile)
+            msk = (self.all_ch_cdf[:, -1, i_ch] < alpha)
+            this_quantile[msk] = self.x_ranges[-1, i_ch]
+            all_quantiles += [this_quantile]
+
+        return np.stack(all_quantiles, axis=-1)
+
+    def plot_decoded(self, plt, ground_truth):
+        if self.n_channels == 3:
+            ax = plt.figure(figsize=(12, 12)).gca(projection='3d')
+        elif self.n_channels == 2:
+            ax = plt.figure(figsize=(12, 12)).gca()
+        else:
+            print("plot_decoded only available for time series with n_channels < 4. Provided "
+                  "time series has {} channels".format(ground_truth.shape[-1]))
+            return
+
+        [ax.plot(*p.T, '.', color='xkcd:blue', alpha=0.01) for p in self.draws]
+        ax.plot(*ground_truth.T, color='xkcd:orange', label='Ground truth', linewidth=3.0)
+        plt.legend(loc=7, prop={'size': 14})
+        plt.title('Sample predictions and ground truth', fontsize=24)
+
+    def plot_channel_cdf(self, plt, ground_truth):
+        fig, axes = plt.subplots(self.n_channels, figsize=(15, 10))
+        fig.suptitle('Cumulative predictive posterior', fontsize=24)
+        c_pal = sns.color_palette('Blues', n_colors=150).as_hex()
+        my_cmap = ListedColormap(c_pal + c_pal[::-1][1:])
+        upper_quant = self.get_quantile(0.975)
+        lower_quant = self.get_quantile(0.025)
+
+        for i_ch in range(self.n_channels):
+            im=axes[i_ch].imshow(self.all_ch_cdf.T[i_ch],
+                              origin='lower',
+                              extent=[0, self.predictive_horizon,
+                                      self.x_ranges[0, i_ch], self.x_ranges[-1, i_ch]],
+                              aspect='auto', cmap=my_cmap)
+            axes[i_ch].plot(lower_quant[:, i_ch], 'xkcd:azure', label='Quantiles')
+            axes[i_ch].plot(upper_quant[:, i_ch], 'xkcd:azure')
+            axes[i_ch].plot(ground_truth[:, i_ch], color='xkcd:orange', label='Ground truth')
+            axes[i_ch].legend(loc=1, prop={'size': 14})
+            divider = make_axes_locatable(axes[i_ch])
+            cax = divider.append_axes('right', size='5%', pad=0.05)
+            fig.colorbar(im, cax=cax)
+
+    def plot_channel_like(self, plt, ground_truth):
+        fig, axes = plt.subplots(self.n_channels, figsize=(15, 10))
+
+        upper_quant = self.get_quantile(0.975)
+        lower_quant = self.get_quantile(0.025)
+        fig.suptitle('Predictive posterior', fontsize=24)
+
+        for i_ch in range(self.n_channels):
+            im = axes[i_ch].imshow(self.all_ch_like.T[i_ch],
+                              origin='lower',
+                              extent=[0, self.predictive_horizon,
+                                      self.x_ranges[0, i_ch], self.x_ranges[-1, i_ch]],
+                              aspect='auto', cmap='Blues', norm=LogNorm(vmin=0.001, vmax=1))
+
+            axes[i_ch].plot(lower_quant[:, i_ch], 'xkcd:azure', label='Quantiles')
+            axes[i_ch].plot(upper_quant[:, i_ch], 'xkcd:azure')
+            axes[i_ch].plot(ground_truth[:, i_ch], color='xkcd:orange', label='Ground truth')
+            axes[i_ch].legend(loc=1, prop={'size': 14})
+            divider = make_axes_locatable(axes[i_ch])
+            cax = divider.append_axes('right', size='5%', pad=0.05)
+            fig.colorbar(im, cax=cax)
+
+    def plot_median_2std(self, plt, ground_truth, with_draws=True):
+        upper_quant = self.get_quantile(0.975)
+        lower_quant = self.get_quantile(0.025)
+        pred_median = self.get_quantile(0.5)
+
+        fig, axes = plt.subplots(self.n_channels, figsize=(15, 10))
+        fig.suptitle('Predictive median and quantiles 2.5 and 97.5', fontsize=24)
+        for i_ch in range(self.n_channels):
+            axes[i_ch].plot(lower_quant[:, i_ch], 'xkcd:azure', label='Quantiles')
+            axes[i_ch].plot(upper_quant[:, i_ch], 'xkcd:azure')
+            axes[i_ch].plot(pred_median[:, i_ch], 'xkcd:azure')
+
+            if with_draws:
+                [axes[i_ch].plot(d[:, i_ch], alpha=0.05, color='xkcd:blue') for d in self.draws]
+
+            axes[i_ch].plot(ground_truth[:, i_ch], color='xkcd:orange', label='Ground truth')
+            axes[i_ch].legend(loc=1, prop={'size': 14})
+
+    def plot_mean_2std(self, plt, ground_truth, with_draws=True):
+        upper_quant = self.get_quantile(0.975)
+        lower_quant = self.get_quantile(0.025)
+
+        fig, axes = plt.subplots(self.n_channels, figsize=(15, 10))
+        fig.suptitle('Predictive mean and quantiles 2.5 and 97.5', fontsize=24)
+        for i_ch in range(self.n_channels):
+            axes[i_ch].plot(lower_quant[:, i_ch], 'xkcd:azure', label='Quantiles')
+            axes[i_ch].plot(upper_quant[:, i_ch], 'xkcd:azure')
+            axes[i_ch].plot(self.pred_mean[:, i_ch], 'xkcd:azure')
+
+            if with_draws:
+                [axes[i_ch].plot(d[:, i_ch], alpha=0.05, color='xkcd:blue') for d in self.draws]
+
+            axes[i_ch].plot(ground_truth[:, i_ch], color='xkcd:orange', label='Ground truth')
+            axes[i_ch].legend(loc=1, prop={'size': 14})
+
+    def rmse_mean(self, ground_truth):
+        return np.sqrt(mean_squared_error(ground_truth, self.pred_mean))
+
+    def rmse_quantile(self, ground_truth, alpha=0.5):
+        return np.sqrt(mean_squared_error(ground_truth, self.get_quantile(alpha)))
+
+    def vbgmm_joint_nll(self, ground_truth):
+        return -np.sum([self.vbgmm[t].score(ground_truth[t:t + 1]) for t in range(self.draws.shape[1])])
+
+    def vbgmm_marginal_nll(self, ground_truth):
+        all_ch_like = []
+        n_mix = self.vbgmm[0].weights_.shape[0]
+
+        for i_ch in range(self.n_channels):
+            ch_like = []
+            for t in range(self.draws.shape[1]):
+                cur_ch_like = 0.
+                this_vbgmm = self.vbgmm[t]
+                for k_mix in range(n_mix):
+                    cur_ch_like += this_vbgmm.weights_[k_mix] * norm.pdf(ground_truth[t:t + 1, i_ch:i_ch + 1],
+                                                                         loc=this_vbgmm.means_[k_mix, i_ch],
+                                                                         scale=np.sqrt(this_vbgmm.covariances_[k_mix,
+                                                                                                               i_ch,
+                                                                                                               i_ch]))
+                ch_like += [cur_ch_like]
+            all_ch_like += [np.concatenate(ch_like, axis=0)]
+
+        return -np.log(np.concatenate(all_ch_like, axis=-1))
+
+    def eval_marginal_like(self, x_ranges):
+        all_ch_like = []
+        n_mix = self.vbgmm[0].weights_.shape[0]
+
+        for i_ch in range(self.n_channels):
+            ch_like = []
+            for t in range(self.draws.shape[1]):
+                cur_ch_like = 0.
+                this_vbgmm = self.vbgmm[t]
+                for k_mix in range(n_mix):
+                    cur_ch_like += this_vbgmm.weights_[k_mix] * norm.pdf(x_ranges[:, i_ch:i_ch+1],
+                                                                         loc=this_vbgmm.means_[k_mix, i_ch],
+                                                                         scale=np.sqrt(this_vbgmm.covariances_[k_mix,
+                                                                                                               i_ch,
+                                                                                                               i_ch]))
+                ch_like += [cur_ch_like]
+            all_ch_like += [np.stack(ch_like, axis=0)]
+
+        return np.concatenate(all_ch_like, axis=-1)
+
+    def eval_marginal_cdf(self, x_ranges):
+        all_ch_like = []
+        n_mix = self.vbgmm[0].weights_.shape[0]
+
+        for i_ch in range(self.n_channels):
+            ch_like = []
+            for t in range(self.draws.shape[1]):
+                cur_ch_like = 0.
+                this_vbgmm = self.vbgmm[t]
+                for k_mix in range(n_mix):
+                    cur_ch_like += this_vbgmm.weights_[k_mix] * norm.cdf(x_ranges[:, i_ch:i_ch+1],
+                                                                         loc=this_vbgmm.means_[k_mix, i_ch],
+                                                                         scale=np.sqrt(this_vbgmm.covariances_[k_mix,
+                                                                                                               i_ch,
+                                                                                                               i_ch]))
+                ch_like += [cur_ch_like]
+            all_ch_like += [np.stack(ch_like, axis=0)]
+
+        return np.concatenate(all_ch_like, axis=-1)
+
+
 class TestDefinition(object):
     """Defines a ground truth and a metric to evaluate predictions on.
     Sequences of tests can be provided and reused across different model strategies, which guarantees result consistency.
@@ -1028,9 +1749,11 @@ class TestDefinition(object):
         compare (function): Function to compare metrics (e.g. ascending or descending)
     """
 
-    def __init__(self, metric_key, ground_truth, compare=None):
+    def __init__(self, metric_key, ground_truth, compare=None, eval_dict={}, id=''):
         self.metric = metric_key
         self.ground_truth = ground_truth
+        self.eval_kwargs = eval_dict
+        self.id = id
         if compare is None:
             self.compare = lambda x,y: x<y
         else:
@@ -1042,7 +1765,7 @@ class TestDefinition(object):
         metric_eval = getattr(prediction, self.metric, None)
 
         if metric_eval is None or not callable(metric_eval):
-            print 'Metric {} is unavailable for this'
+            print('Metric {} is unavailable for this')
             result =  None
         else:
             result = metric_eval(self.ground_truth)
